@@ -1,0 +1,14 @@
+canary: rivalsss
+
+preload_script: js/preload.js
+ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+# ua: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 YaBrowser/25.4.0.0 Safari/537.36
+
+# TODO count from links
+topparams: [add, address, aid, auth, auth_token, back, back_location, bid, cal, cid, code, 
+            config, country, data, debug, demo, did, eid, email, error, example, fid, file, first_name, 
+            frame, get, gid, goto, head, height, hid, higher, host, href, index, input, key, keyword, kid, 
+            last, last_name, lid, link, load, location, log, lower, mail, message, mid, net, new, nid, oid, 
+            old, out, pass, passwd, password, pid, q, qid, query, redir, redirect, ref, result, returl, 
+            return_to, rid, rurl, s, sid, source, src, test, text, tid, title, token, topic, u, uid, url, 
+            user, userid, username, var, vid, wid, width, x, xid, y, yid, zid, ver, version]
