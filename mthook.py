@@ -1,6 +1,8 @@
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
+import os
 import re
+import signal
 import threading
 from lxml import html as lxml_html
 import argparse
@@ -43,6 +45,22 @@ def is_closed_error(e):
             or 'Target closed' in msg
             or 'Browser closed' in msg
             or 'Connection closed' in msg)
+
+
+def kill_node_driver(pid):
+    """SIGKILL the playwright node driver subprocess. Called from the watchdog
+    thread instead of Browser.close() — close() can't safely run off the
+    worker's playwright-bound thread and silently leaks the driver (and its
+    Chromium child) when the worker is hung. Chromium sets PR_SET_PDEATHSIG,
+    so killing node cascades to its Chromium child via the kernel."""
+    if not pid:
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        print(f"[watchdog] kill node pid {pid}: {e}", file=sys.stderr)
 
 
 def domain_is_blocked(domain):
@@ -621,9 +639,14 @@ def process_url(context, url):
 
 def worker(wid, queue: Queue, done_event: threading.Event):
     with worker_state_lock:
-        worker_state.setdefault(wid, {'last': time.time(), 'browser': None})
+        worker_state.setdefault(wid, {'last': time.time(), 'node_pid': None})
     try:
         with sync_playwright() as p:
+            try:
+                node_pid = p._impl_obj._connection._transport._proc.pid
+            except Exception:
+                node_pid = None
+
             def launch_browser():
                 browser = p.chromium.launch(args=[
                     '--js-flags=--max-old-space-size=500',
@@ -644,7 +667,7 @@ def worker(wid, queue: Queue, done_event: threading.Event):
 
             browser, context = launch_browser()
             with worker_state_lock:
-                worker_state[wid] = {'last': time.time(), 'browser': browser}
+                worker_state[wid] = {'last': time.time(), 'node_pid': node_pid}
             processed = 0
             while True:
                 try:
@@ -681,7 +704,6 @@ def worker(wid, queue: Queue, done_event: threading.Event):
                         break
                     with worker_state_lock:
                         if wid in worker_state:
-                            worker_state[wid]['browser'] = browser
                             worker_state[wid]['last'] = time.time()
                     processed = 0
                     continue
@@ -708,7 +730,7 @@ def watchdog(queue, next_wid_holder, target_workers, stop_event, done_event):
         new_wid = next_wid_holder[0]
         next_wid_holder[0] += 1
         with worker_state_lock:
-            worker_state[new_wid] = {'last': time.time(), 'browser': None}
+            worker_state[new_wid] = {'last': time.time(), 'node_pid': None}
         t = threading.Thread(target=worker, args=(new_wid, queue, done_event), daemon=True)
         t.start()
 
@@ -719,20 +741,16 @@ def watchdog(queue, next_wid_holder, target_workers, stop_event, done_event):
         with worker_state_lock:
             for wid, st in list(worker_state.items()):
                 if now - st['last'] > WORKER_TIMEOUT:
-                    stuck.append((wid, st['browser'], st.get('url')))
+                    stuck.append((wid, st.get('node_pid'), st.get('url')))
                     worker_state.pop(wid, None)
-        for wid, br, hung_url in stuck:
+        for wid, node_pid, hung_url in stuck:
             if hung_url:
                 d = urlparse(hung_url).netloc
                 count = domain_record_error(d)
-                print(f"[watchdog] worker {wid} hung > {WORKER_TIMEOUT}s on {hung_url} [{d} err {count}/{DOMAIN_MAX_ERRORS}], killing browser", file=sys.stderr)
+                print(f"[watchdog] worker {wid} hung > {WORKER_TIMEOUT}s on {hung_url} [{d} err {count}/{DOMAIN_MAX_ERRORS}], killing driver pid {node_pid}", file=sys.stderr)
             else:
-                print(f"[watchdog] worker {wid} hung > {WORKER_TIMEOUT}s (idle), killing browser", file=sys.stderr)
-            try:
-                if br is not None:
-                    br.close()
-            except Exception:
-                pass
+                print(f"[watchdog] worker {wid} hung > {WORKER_TIMEOUT}s (idle), killing driver pid {node_pid}", file=sys.stderr)
+            kill_node_driver(node_pid)
             spawn_worker()
         # Top up workers that died on their own (e.g. browser crash, OOM, exception).
         # Skip when work is drained — those workers exited normally.
