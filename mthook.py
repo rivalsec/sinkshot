@@ -691,6 +691,21 @@ def inject_canary_params(url, canary):
 BLOCKED_RESOURCE_TYPES = {'image', 'media', 'font'}
 
 
+def is_html_content_type(ct):
+    """True if a main-document response with this Content-Type could be an
+    HTML page Chromium renders and runs scripts in. 'text/html' also covers
+    text/html-sandboxed via substring; the XML types cover XHTML payloads
+    (rendered in XML mode). An EMPTY type counts too: Chromium sniffs
+    unknown/absent types and may render HTML with scripts running, so the
+    reflection scan still needs the body. The canary is unique, so scanning
+    a non-HTML body can't false-positive."""
+    ct = (ct or '').strip().lower()
+    if not ct:
+        return True
+    return any(t in ct for t in ('text/html', 'application/xhtml+xml',
+                                 'text/xml', 'application/xml'))
+
+
 def process_url(context, url, heartbeat=None):
         beat = heartbeat or (lambda: None)
         url_domain = urlparse(url).netloc
@@ -711,10 +726,9 @@ def process_url(context, url, heartbeat=None):
             target_url = url + f"#{config['canary']}_hash"
 
             def capture_response(response):
-                # capture the main document response body. XHTML documents
-                # (application/xhtml+xml) are HTML for reflection purposes too.
-                ct = response.headers.get('content-type', '')
-                if response.url.split('#')[0] == url and ('text/html' in ct or 'application/xhtml+xml' in ct):
+                # capture the main document response body for the reflection
+                # scan — see is_html_content_type for what qualifies.
+                if response.url.split('#')[0] == url and is_html_content_type(response.headers.get('content-type', '')):
                     main_status[0] = response.status
                     try:
                         raw_body.append(response.text())

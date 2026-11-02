@@ -673,6 +673,21 @@ async function process_url_stage2_reflected(context, base_url, payloads) {
 // stage 1 — discovery
 // ---------------------------------------------------------------------------
 
+const HTML_CONTENT_TYPES = ['text/html', 'application/xhtml+xml', 'text/xml', 'application/xml'];
+
+function is_html_content_type(ct) {
+    // True if a main-document response with this Content-Type could be an
+    // HTML page Chromium renders and runs scripts in. 'text/html' also covers
+    // text/html-sandboxed via substring; the XML types cover XHTML payloads
+    // (rendered in XML mode). An empty/absent type counts too: Chromium
+    // sniffs unknown types and may render HTML with scripts running, so the
+    // reflection scan still needs the body. The canary is unique, so scanning
+    // a non-HTML body can't false-positive.
+    const v = (ct || '').trim().toLowerCase();
+    if (!v) return true;
+    return HTML_CONTENT_TYPES.some((t) => v.includes(t));
+}
+
 async function process_url(context, url) {
     const url_domain = netloc(url);
     if (domain_is_blocked(url_domain)) return;
@@ -698,10 +713,9 @@ async function process_url(context, url) {
             try {
                 if (mainResponse) return;
                 const rurl = response.url().split('#')[0];
-                const ct = response.headers()['content-type'] || '';
-                // XHTML documents (application/xhtml+xml) are HTML for
-                // reflection purposes too.
-                if (rurl === url && (ct.includes('text/html') || ct.includes('application/xhtml+xml'))) {
+                // Capture the main document response body for the reflection
+                // scan — see is_html_content_type for what qualifies.
+                if (rurl === url && is_html_content_type(response.headers()['content-type'])) {
                     mainResponse = response;
                     mainStatus.value = response.status();
                 }
