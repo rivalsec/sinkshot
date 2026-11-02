@@ -532,16 +532,28 @@ function get_payloads(sink, canary) {
             results.push({ key, sink: stype, ctx: 'url',
                 payload: `javascript:rsjsstorage.alertfunc('${key}')` });
         } else if (HTML_SINKS.has(stype)) {
-            const htmlCtx = detect_html_context(code, canary, key);
+            // createElement single-tag shape: code is exactly `<canary+key>`,
+            // meaning a jQuery-style $(value) call hit the HTML branch of its
+            // HTML-vs-selector heuristic on the wrapped canary (preload.js
+            // wraps canaries in <…> on purpose). The confirmation payload must
+            // ALSO start with '<' or the heuristic routes it to the selector
+            // path at confirm time and nothing executes. No breakout prefix:
+            // the canary was the whole fragment, not text inside markup.
+            // (Mirrors mthook.py.)
             let payload;
-            if (htmlCtx === 'unquoted') {
-                payload = `></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror="rsjsstorage.alertfunc('${key}')">`;
-            } else if (htmlCtx === 'single') {
-                payload = `'></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror="rsjsstorage.alertfunc('${key}')">`;
-            } else if (htmlCtx === 'double') {
-                payload = `"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror="rsjsstorage.alertfunc('${key}')">`;
+            if (code === `<${canary}${key}>`) {
+                payload = `<img/src/onerror=rsjsstorage.alertfunc('${key}')>`;
             } else {
-                payload = `'"></stYle/</titLe/</teXtarEa/</scRipt/--!><img/src/onerror="rsjsstorage.alertfunc('${key}')">`;
+                const htmlCtx = detect_html_context(code, canary, key);
+                if (htmlCtx === 'unquoted') {
+                    payload = `></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror="rsjsstorage.alertfunc('${key}')">`;
+                } else if (htmlCtx === 'single') {
+                    payload = `'></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror="rsjsstorage.alertfunc('${key}')">`;
+                } else if (htmlCtx === 'double') {
+                    payload = `"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror="rsjsstorage.alertfunc('${key}')">`;
+                } else {
+                    payload = `'"></stYle/</titLe/</teXtarEa/</scRipt/--!><img/src/onerror="rsjsstorage.alertfunc('${key}')">`;
+                }
             }
             results.push({ key, sink: stype, ctx: 'html', payload });
         } else if (stype.startsWith('setAttribute_')) {
@@ -618,7 +630,12 @@ async function process_url_stage2(context, url, payloads) {
         try {
             await page.waitForFunction(
                 (n) => window.rsjsstorage && window.rsjsstorage.jsEvals.length >= n,
-                expected, { timeout: 1500 });
+                // Heavy SPAs hydrate long after `commit`; the sink path (and
+                // the alertfunc call) often fires seconds later. 1.5s
+                // systematically under-confirmed; 5s covers hydration + late
+                // timers without dominating scan time (stage 2 only runs on
+                // pages with sinks). Mirrors mthook.py.
+                expected, { timeout: 5000 });
         } catch { /* timeout ok */ }
         const js_evals = await page.evaluate(
             () => (window.rsjsstorage ? window.rsjsstorage.jsEvals : null));
@@ -655,7 +672,9 @@ async function process_url_stage2_reflected(context, base_url, payloads) {
             try {
                 await page.waitForFunction(
                     (k) => window.rsjsstorage && window.rsjsstorage.jsEvals.includes(k),
-                    p.key, { timeout: 1500 });
+                    // Same rationale as process_url_stage2: SPA hydration and
+                    // late timers need more than 1.5s. Mirrors mthook.py.
+                    p.key, { timeout: 5000 });
             } catch { /* timeout ok */ }
             const js_evals = await page.evaluate(
                 () => (window.rsjsstorage ? window.rsjsstorage.jsEvals : null)) || [];

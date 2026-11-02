@@ -823,6 +823,17 @@ def process_url(context, url, heartbeat=None):
             else:
                 page.wait_for_timeout(300)
             beat()
+            # The target never actually loaded: a net-layer failure (connection
+            # reset, cert error, DNS/unsafe port...) lands Chromium on
+            # chrome-error://, and a 204'd initial nav leaves it on about:blank.
+            # preload.js skips both, so rsjsstorage is absent — surface the
+            # real reason instead of a misleading "no rsjsstorage" line.
+            # (Ported back from mthook.js.)
+            landed = page.url
+            if landed.startswith('chrome-error://') or landed == 'about:blank':
+                if debug_mode:
+                    print(f"[load failed] {url} (no document committed)", file=sys.stderr)
+                return
             rsjsstorage = page.evaluate("""() => {
                 return window.rsjsstorage
             }""")
