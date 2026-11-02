@@ -1,0 +1,18 @@
+# Node.js version of the scanner (runs mthook.js).
+# The base image tag MUST match the playwright version resolved in
+# package-lock.json (currently 1.61.1) — the image ships only the Chromium build
+# for that exact version. A mismatch causes "Executable doesn't exist at
+# /ms-playwright/chromium_headless_shell-.../chrome-headless-shell" at launch.
+# It ships Chromium + system deps preinstalled, so no `playwright install` is needed.
+FROM mcr.microsoft.com/playwright:v1.61.1-jammy
+
+WORKDIR /app
+
+# Install deps first so the layer is cached unless the manifest changes.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY mthook.js config.yaml ./
+COPY js/ ./js/
+
+ENTRYPOINT ["node", "mthook.js"]

@@ -1,0 +1,17 @@
+{
+  "name": "sinkshot",
+  "version": "1.0.0",
+  "description": "DOM XSS scanner built on Playwright (Node.js port of mthook.py)",
+  "type": "commonjs",
+  "bin": {
+    "sinkshot": "mthook.js"
+  },
+  "scripts": {
+    "start": "node mthook.js"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "parse5": "^7.3.0",
+    "playwright": "^1.58.0"
+  }
+}
