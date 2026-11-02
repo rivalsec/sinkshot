@@ -723,17 +723,32 @@ def process_url(context, url, heartbeat=None):
             url = inject_canary_params(url, config['canary'])
             raw_body = []
             main_status = [None]
+            main_non_html = [False]
+            main_ct = ['']
+            main_checked = [False]
             target_url = url + f"#{config['canary']}_hash"
 
             def capture_response(response):
-                # capture the main document response body for the reflection
-                # scan — see is_html_content_type for what qualifies.
-                if response.url.split('#')[0] == url and is_html_content_type(response.headers.get('content-type', '')):
-                    main_status[0] = response.status
-                    try:
-                        raw_body.append(response.text())
-                    except Exception:
-                        pass
+                # First response matching the URL = the main document. Capture
+                # its body for the reflection scan — see is_html_content_type
+                # for what qualifies — or flag non-HTML so process_url omits
+                # the URL after this first request. 3xx never decides either
+                # way: the redirect chain continues to the real document (and
+                # Playwright can't fetch redirect bodies anyway).
+                if main_checked[0] or response.url.split('#')[0] != url:
+                    return
+                main_checked[0] = True
+                main_status[0] = response.status
+                main_ct[0] = response.headers.get('content-type', '')
+                if 300 <= response.status < 400:
+                    return
+                if not is_html_content_type(main_ct[0]):
+                    main_non_html[0] = True
+                    return
+                try:
+                    raw_body.append(response.text())
+                except Exception:
+                    pass
 
             page.on("response", capture_response)
 
@@ -778,6 +793,19 @@ def process_url(context, url, heartbeat=None):
             except PlaywrightTimeoutError:
                 pass
             beat()
+            if main_non_html[0]:
+                # The FIRST request came back non-HTML (JSON/PDF/plain text/
+                # binary/...): no page JS ever runs, so there are no DOM sinks
+                # to find and no reflection body was captured — the settle
+                # wait, evaluate and any stage-2 requests are pure waste.
+                # Omit the URL here. (SVG documents are the one script-capable
+                # casualty — rare as main documents; revisit if that matters.)
+                if debug_mode:
+                    print(f"[skip non-html] {url} content-type={main_ct[0]!r} status={main_status[0]}", file=sys.stderr)
+                if main_status[0] and main_status[0] >= 400:
+                    print(f"[{url_domain}] main document {main_status[0]} for {url} "
+                          f"(likely blocked/rate-limited — no findings possible)", file=sys.stderr)
+                return
             # Post-commit settle: 'load' and 'domcontentloaded' never fire on
             # pages where the IIFE triggers a canary nav that we 204; waiting
             # on them costs the full timeout. networkidle is safer because the

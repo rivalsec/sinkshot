@@ -708,17 +708,30 @@ async function process_url(context, url) {
 
         let mainResponse = null;
         const mainStatus = { value: null };
+        const mainNonHtml = { flag: false, ct: '' };
+        let mainChecked = false;
 
         page.on('response', (response) => {
             try {
-                if (mainResponse) return;
+                // First response matching the URL = the main document.
+                if (mainChecked) return;
                 const rurl = response.url().split('#')[0];
-                // Capture the main document response body for the reflection
-                // scan — see is_html_content_type for what qualifies.
-                if (rurl === url && is_html_content_type(response.headers()['content-type'])) {
-                    mainResponse = response;
-                    mainStatus.value = response.status();
+                if (rurl !== url) return;
+                mainChecked = true;
+                const ct = response.headers()['content-type'] || '';
+                mainStatus.value = response.status();
+                // Capture the body for the reflection scan — see
+                // is_html_content_type for what qualifies — or flag non-HTML
+                // so process_url omits the URL after this first request.
+                // 3xx never decides either way: the redirect chain continues
+                // to the real document (and redirect bodies can't be fetched).
+                if (response.status() >= 300 && response.status() < 400) return;
+                if (!is_html_content_type(ct)) {
+                    mainNonHtml.flag = true;
+                    mainNonHtml.ct = ct;
+                    return;
                 }
+                mainResponse = response;
             } catch { /* ignore */ }
         });
 
@@ -754,6 +767,23 @@ async function process_url(context, url) {
         try {
             await page.goto(target_url, { timeout: 10000, waitUntil: 'commit' });
         } catch (e) { goto_err = e; /* timeout ok; net errors handled below */ }
+
+        if (mainNonHtml.flag) {
+            // The FIRST request came back non-HTML (JSON/PDF/plain text/
+            // binary/...): no page JS ever runs, so there are no DOM sinks to
+            // find and no reflection body was captured — the settle wait,
+            // evaluate and any stage-2 requests are pure waste. Omit the URL
+            // here. (SVG documents are the one script-capable casualty — rare
+            // as main documents; revisit if that matters.)
+            if (debug_mode) {
+                eprint(`[skip non-html] ${url} content-type='${mainNonHtml.ct}' status=${mainStatus.value}`);
+            }
+            if (mainStatus.value && mainStatus.value >= 400) {
+                eprint(`[${url_domain}] main document ${mainStatus.value} for ${url} `
+                    + `(likely blocked/rate-limited — no findings possible)`);
+            }
+            return;
+        }
 
         // Post-commit settle. 'load'/'domcontentloaded' never fire on pages
         // where an IIFE triggers a canary nav we 204; networkidle is safer
