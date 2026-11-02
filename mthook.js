@@ -773,8 +773,12 @@ async function process_url(context, url) {
             // binary/...): no page JS ever runs, so there are no DOM sinks to
             // find and no reflection body was captured — the settle wait,
             // evaluate and any stage-2 requests are pure waste. Omit the URL
-            // here. (SVG documents are the one script-capable casualty — rare
-            // as main documents; revisit if that matters.)
+            // here. (SVG main documents are also omitted even though scripts
+            // run there: verified empirically that sources register, but in
+            // XML mode innerHTML with any HTML markup THROWS, so the
+            // HTML-breakout confirmation payloads can never execute — only
+            // pure JS sinks could confirm, which is negligible on top of
+            // SVG-as-main-document being rare.)
             if (debug_mode) {
                 eprint(`[skip non-html] ${url} content-type='${mainNonHtml.ct}' status=${mainStatus.value}`);
             }
