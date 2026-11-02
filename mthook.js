@@ -725,32 +725,29 @@ async function process_url(context, url) {
         const target_url = url + `#${canary}_hash`;
         const target_url_no_hash = target_url.split('#')[0];
 
-        let mainResponse = null;
-        const mainStatus = { value: null };
-        const mainNonHtml = { flag: false, ct: '' };
-        let mainChecked = false;
+        // The document that actually RENDERS: the last non-redirect main-frame
+        // navigation response. Keying on the requested URL (the old approach)
+        // only ever saw the first hop, so redirected URLs (http->https,
+        // apex->www, trailing slash) never had their final HTML captured for
+        // the reflection scan, a redirect to a non-HTML target wasn't skipped,
+        // and a WAF block page behind a redirect was invisible to the >=400
+        // warning. 3xx never decides (the chain continues); 204 never decides
+        // (nav_route fulfills canary navigations with 204, and a 204 renders
+        // nothing). The body is fetched lazily at analysis time, so
+        // superseded hops cost nothing.
+        const mainDoc = { response: null, status: null, ct: '' };
 
         page.on('response', (response) => {
             try {
-                // First response matching the URL = the main document.
-                if (mainChecked) return;
-                const rurl = response.url().split('#')[0];
-                if (rurl !== url) return;
-                mainChecked = true;
-                const ct = response.headers()['content-type'] || '';
-                mainStatus.value = response.status();
-                // Capture the body for the reflection scan — see
-                // is_html_content_type for what qualifies — or flag non-HTML
-                // so process_url omits the URL after this first request.
-                // 3xx never decides either way: the redirect chain continues
-                // to the real document (and redirect bodies can't be fetched).
-                if (response.status() >= 300 && response.status() < 400) return;
-                if (!is_html_content_type(ct)) {
-                    mainNonHtml.flag = true;
-                    mainNonHtml.ct = ct;
-                    return;
-                }
-                mainResponse = response;
+                const req = response.request();
+                if (!req.isNavigationRequest()
+                        || req.resourceType() !== 'document'
+                        || req.frame() !== page.mainFrame()) return;
+                const status = response.status();
+                if (status === 204 || (status >= 300 && status < 400)) return;
+                mainDoc.response = response;
+                mainDoc.status = status;
+                mainDoc.ct = response.headers()['content-type'] || '';
             } catch { /* ignore */ }
         });
 
@@ -787,22 +784,22 @@ async function process_url(context, url) {
             await page.goto(target_url, { timeout: 10000, waitUntil: 'commit' });
         } catch (e) { goto_err = e; /* timeout ok; net errors handled below */ }
 
-        if (mainNonHtml.flag) {
-            // The FIRST request came back non-HTML (JSON/PDF/plain text/
-            // binary/...): no page JS ever runs, so there are no DOM sinks to
-            // find and no reflection body was captured — the settle wait,
-            // evaluate and any stage-2 requests are pure waste. Omit the URL
-            // here. (SVG main documents are also omitted even though scripts
-            // run there: verified empirically that sources register, but in
-            // XML mode innerHTML with any HTML markup THROWS, so the
-            // HTML-breakout confirmation payloads can never execute — only
-            // pure JS sinks could confirm, which is negligible on top of
-            // SVG-as-main-document being rare.)
+        if (mainDoc.response && !is_html_content_type(mainDoc.ct)) {
+            // The final document of the FIRST request's redirect chain came
+            // back non-HTML (JSON/PDF/plain text/binary/...): no page JS ever
+            // runs, so there are no DOM sinks to find and no reflection body
+            // was captured — the settle wait, evaluate and any stage-2
+            // requests are pure waste. Omit the URL here. (SVG main documents
+            // are also omitted even though scripts run there: verified
+            // empirically that sources register, but in XML mode innerHTML
+            // with any HTML markup THROWS, so the HTML-breakout confirmation
+            // payloads can never execute — only pure JS sinks could confirm,
+            // which is negligible on top of SVG-as-main-document being rare.)
             if (debug_mode) {
-                eprint(`[skip non-html] ${url} content-type='${mainNonHtml.ct}' status=${mainStatus.value}`);
+                eprint(`[skip non-html] ${url} content-type='${mainDoc.ct}' status=${mainDoc.status}`);
             }
-            if (mainStatus.value && mainStatus.value >= 400) {
-                eprint(`[${url_domain}] main document ${mainStatus.value} for ${url} `
+            if (mainDoc.status && mainDoc.status >= 400) {
+                eprint(`[${url_domain}] main document ${mainDoc.status} for ${url} `
                     + `(likely blocked/rate-limited — no findings possible)`);
             }
             return;
@@ -846,11 +843,12 @@ async function process_url(context, url) {
         const domain = netloc(current_url);
         rsjsstorage.dom_url = build_dom_url(current_url, rsjsstorage.uspRevealed || [], canary);
 
-        // check raw response for reflected canary with context
+        // check raw response for reflected canary with context (the final
+        // document after any redirects)
         let new_reflected = [];
-        if (mainResponse) {
+        if (mainDoc.response) {
             let raw = null;
-            try { raw = await mainResponse.text(); } catch { /* ignore */ }
+            try { raw = await mainDoc.response.text(); } catch { /* ignore */ }
             if (raw) {
                 const reflected = find_reflected_canaries(raw, canary);
                 new_reflected = filter_new_reflected(domain, reflected);
@@ -898,8 +896,8 @@ async function process_url(context, url) {
 
         // Surface WAF/error pages: a blocked doc has no sinks and reflects
         // nothing, so it's otherwise indistinguishable from a clean page.
-        if (mainStatus.value && mainStatus.value >= 400) {
-            eprint(`[${url_domain}] main document ${mainStatus.value} for ${url} `
+        if (mainDoc.status && mainDoc.status >= 400) {
+            eprint(`[${url_domain}] main document ${mainDoc.status} for ${url} `
                 + `(likely blocked/rate-limited — no findings possible)`);
         }
         if (debug_mode) {
@@ -908,7 +906,7 @@ async function process_url(context, url) {
                     uspRevealed: rsjsstorage.uspRevealed, sinks: new_sinks, confirmed,
                     reflected: rsjsstorage.reflected }));
             } else {
-                eprint(`[no findings] ${current_url} status=${mainStatus.value} `
+                eprint(`[no findings] ${current_url} status=${mainDoc.status} `
                     + `(rsjsstorage ok, 0 sinks / 0 reflected)`);
             }
         }

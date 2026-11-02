@@ -721,32 +721,34 @@ def process_url(context, url, heartbeat=None):
 
         try:
             url = inject_canary_params(url, config['canary'])
-            raw_body = []
+            main_doc = [None]   # response of the final rendered document
             main_status = [None]
-            main_non_html = [False]
             main_ct = ['']
-            main_checked = [False]
             target_url = url + f"#{config['canary']}_hash"
 
             def capture_response(response):
-                # First response matching the URL = the main document. Capture
-                # its body for the reflection scan — see is_html_content_type
-                # for what qualifies — or flag non-HTML so process_url omits
-                # the URL after this first request. 3xx never decides either
-                # way: the redirect chain continues to the real document (and
-                # Playwright can't fetch redirect bodies anyway).
-                if main_checked[0] or response.url.split('#')[0] != url:
-                    return
-                main_checked[0] = True
-                main_status[0] = response.status
-                main_ct[0] = response.headers.get('content-type', '')
-                if 300 <= response.status < 400:
-                    return
-                if not is_html_content_type(main_ct[0]):
-                    main_non_html[0] = True
-                    return
+                # Track the document that actually RENDERS: the last
+                # non-redirect main-frame navigation response. Keying on the
+                # requested URL (the old approach) only ever saw the first
+                # hop, so redirected URLs (http->https, apex->www, trailing
+                # slash) never had their final HTML captured for the
+                # reflection scan, a redirect to a non-HTML target wasn't
+                # skipped, and a WAF block page behind a redirect was
+                # invisible to the >=400 warning. 3xx never decides (the
+                # chain continues); 204 never decides (nav_route fulfills
+                # canary navigations with 204, and a 204 renders nothing).
+                # The body is fetched lazily at analysis time, so superseded
+                # hops cost nothing.
                 try:
-                    raw_body.append(response.text())
+                    req = response.request
+                    if (req.is_navigation_request()
+                            and req.resource_type == 'document'
+                            and req.frame == page.main_frame
+                            and response.status != 204
+                            and not 300 <= response.status < 400):
+                        main_doc[0] = response
+                        main_status[0] = response.status
+                        main_ct[0] = response.headers.get('content-type', '')
                 except Exception:
                     pass
 
@@ -793,17 +795,18 @@ def process_url(context, url, heartbeat=None):
             except PlaywrightTimeoutError:
                 pass
             beat()
-            if main_non_html[0]:
-                # The FIRST request came back non-HTML (JSON/PDF/plain text/
-                # binary/...): no page JS ever runs, so there are no DOM sinks
-                # to find and no reflection body was captured — the settle
-                # wait, evaluate and any stage-2 requests are pure waste.
-                # Omit the URL here. (SVG main documents are also omitted even
-                # though scripts run there: verified empirically that sources
-                # register, but in XML mode innerHTML with any HTML markup
-                # THROWS, so the HTML-breakout confirmation payloads can never
-                # execute — only pure JS sinks could confirm, which is
-                # negligible on top of SVG-as-main-document being rare.)
+            if main_doc[0] is not None and not is_html_content_type(main_ct[0]):
+                # The final document of the FIRST request's redirect chain came
+                # back non-HTML (JSON/PDF/plain text/binary/...): no page JS
+                # ever runs, so there are no DOM sinks to find and no
+                # reflection body was captured — the settle wait, evaluate and
+                # any stage-2 requests are pure waste. Omit the URL here.
+                # (SVG main documents are also omitted even though scripts run
+                # there: verified empirically that sources register, but in
+                # XML mode innerHTML with any HTML markup THROWS, so the
+                # HTML-breakout confirmation payloads can never execute — only
+                # pure JS sinks could confirm, which is negligible on top of
+                # SVG-as-main-document being rare.)
                 if debug_mode:
                     print(f"[skip non-html] {url} content-type={main_ct[0]!r} status={main_status[0]}", file=sys.stderr)
                 if main_status[0] and main_status[0] >= 400:
@@ -846,10 +849,17 @@ def process_url(context, url, heartbeat=None):
             domain = urlparse(current_url).netloc
             rsjsstorage['dom_url'] = build_dom_url(current_url, rsjsstorage.get('uspRevealed') or [], config['canary'])
 
-            # check raw response for reflected canary with context
+            # check raw response for reflected canary with context (the final
+            # document after any redirects)
             new_reflected = []
+            raw_body = None
+            if main_doc[0] is not None:
+                try:
+                    raw_body = main_doc[0].text()
+                except Exception:
+                    raw_body = None
             if raw_body:
-                reflected = find_reflected_canaries(raw_body[0], config['canary'])
+                reflected = find_reflected_canaries(raw_body, config['canary'])
                 new_reflected = filter_new_reflected(domain, reflected)
                 if new_reflected:
                     rsjsstorage['reflected'] = new_reflected
