@@ -1,4 +1,13 @@
 
+// Don't initialize on pages we can't scan: the initial about:blank shown
+// before the first navigation, and the chrome-error:// fallback Chromium lands
+// on when a load fails. Otherwise addInitScript would leave a stray
+// rsjsstorage there that masquerades as a scanned-but-clean page.
+if (window.location.href === 'about:blank'
+        || window.location.protocol === 'chrome-error:') {
+    return;
+}
+
 window.rsjsstorage = {
     originurl: window.location.href,
     uspRevealed: [],
