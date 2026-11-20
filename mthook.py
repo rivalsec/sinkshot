@@ -643,6 +643,20 @@ def process_url_stage2(context, url, payloads, heartbeat=None):
         except PlaywrightTimeoutError:
             pass
         beat()
+        # Settle before starting the verification clock: heavy SPA/ad pages
+        # keep booting (bundle fetch, hydration, ad auctions) for seconds
+        # after commit, and the alertfunc call often fires only after the
+        # page has gone network-idle once. A fixed window measured from
+        # commit loses that race on cold loads (observed on finance.mail.ru
+        # slot-data: sink fires ~1.2 s warm, >5 s cold). Mirrors stage 1;
+        # -w raises the window.
+        try:
+            page.wait_for_load_state(
+                'networkidle',
+                timeout=int(stage1_wait * 1000) if stage1_wait else STAGE1_NETIDLE_MS)
+        except Exception:
+            pass
+        beat()
         expected = len(payloads)
         try:
             page.wait_for_function(
@@ -707,6 +721,16 @@ def process_url_stage2_reflected(context, base_url, payloads, heartbeat=None):
             try:
                 page.goto(target_url, timeout=10000, wait_until='commit')
             except PlaywrightTimeoutError:
+                pass
+            beat()
+            # Same settle as process_url_stage2: verification clock starts
+            # only after the page went network-idle once, so slow hydration
+            # can't eat the 5 s window. Mirrors stage 1; -w raises it.
+            try:
+                page.wait_for_load_state(
+                    'networkidle',
+                    timeout=int(stage1_wait * 1000) if stage1_wait else STAGE1_NETIDLE_MS)
+            except Exception:
                 pass
             beat()
             try:
@@ -1210,7 +1234,7 @@ def main():
     parser = argparse.ArgumentParser(description="Process URLs with DOMScan.")
     parser.add_argument('-u','--urls', help="File containing URLs to process")
     parser.add_argument('-t','--threads', type=int, default=10, help="Maximum number of threads to use")
-    parser.add_argument('-w','--wait', type=float, default=0, help="Stage-1 networkidle window in seconds (default: 3s built in; raise for slow SPA/ad hydration)")
+    parser.add_argument('-w','--wait', type=float, default=0, help="networkidle settle window in seconds, stage 1 and stage-2 verification (default: 3s built in; raise for slow SPA/ad hydration)")
     parser.add_argument('-o','--output', help="File to write confirmed findings to (truncated on open)")
     parser.add_argument('-d','--debug', action='store_true', help="Print unconfirmed sinks and reflected hits to stdout")
     parser.add_argument('-D','--dedup', action='store_true', help="Enable per-domain sink/reflected deduplication")

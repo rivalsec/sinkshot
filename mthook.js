@@ -686,6 +686,18 @@ async function process_url_stage2(context, url, payloads, beat = () => {}) {
             await page.goto(target_url, { timeout: 10000, waitUntil: 'commit' });
         } catch { /* timeout ok */ }
         beat();
+        // Settle before starting the verification clock: heavy SPA/ad pages
+        // keep booting (bundle fetch, hydration, ad auctions) for seconds
+        // after commit, and the alertfunc call often fires only after the
+        // page has gone network-idle once. A fixed window measured from
+        // commit loses that race on cold loads (observed on finance.mail.ru
+        // slot-data). Mirrors stage 1; -w raises the window. (Mirrors
+        // mthook.py.)
+        {
+            const ms = stage1_wait ? Math.round(stage1_wait * 1000) : STAGE1_NETIDLE_MS;
+            try { await page.waitForLoadState('networkidle', { timeout: ms }); } catch { /* ignore */ }
+        }
+        beat();
         const expected = payloads.length;
         try {
             await page.waitForFunction(
@@ -733,6 +745,14 @@ async function process_url_stage2_reflected(context, base_url, payloads, beat = 
             try {
                 await page.goto(target_url, { timeout: 10000, waitUntil: 'commit' });
             } catch { /* timeout ok */ }
+            beat();
+            // Same settle as processUrlStage2: verification clock starts only
+            // after the page went network-idle once. Mirrors stage 1; -w
+            // raises it. (Mirrors mthook.py.)
+            {
+                const ms = stage1_wait ? Math.round(stage1_wait * 1000) : STAGE1_NETIDLE_MS;
+                try { await page.waitForLoadState('networkidle', { timeout: ms }); } catch { /* ignore */ }
+            }
             beat();
             try {
                 await page.waitForFunction(
@@ -1288,8 +1308,9 @@ function printHelp() {
 
   -u, --urls FILE        File containing URLs to process (else read stdin)
   -t, --threads N        Concurrent workers (default 10)
-  -w, --wait SECONDS     Stage-1 networkidle window in seconds (default: 3s
-                         built in; raise for slow SPA/ad hydration)
+  -w, --wait SECONDS     networkidle settle window in seconds, stage 1 and
+                         stage-2 verification (default: 3s built in; raise
+                         for slow SPA/ad hydration)
   -o, --output FILE      File to write confirmed findings to (truncated)
   -d, --debug            Print unconfirmed sinks and reflected hits to stderr
   -D, --dedup            Enable per-domain sink/reflected deduplication
