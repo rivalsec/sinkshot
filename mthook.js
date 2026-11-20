@@ -49,8 +49,10 @@ let viewport = null;
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font']);
 const DOMAIN_MAX_ERRORS = 10;
 const BROWSER_REFRESH_INTERVAL = 50;  // URLs per browser before recycle (caps Chromium memory)
-const URL_HANG_TIMEOUT = 60000;       // hard ceiling per URL; page.evaluate() has no internal timeout,
-                                      // so a wedged renderer (busy JS loop) would hang a worker forever
+const STAGE1_NETIDLE_MS = 3000;       // default post-commit networkidle window when -w is not set
+const URL_HANG_TIMEOUT = 60000;       // max time WITHOUT progress per URL (stage 2 beats as payloads
+                                      // complete); page.evaluate() has no internal timeout, so a wedged
+                                      // renderer (busy JS loop) would hang a worker forever
 const CLOSE_TIMEOUT = 10000;          // ceiling on context/browser close so recycle can't hang on a wedged browser
 
 const domain_errors = new Map();
@@ -364,7 +366,7 @@ function get_reflected_payloads(reflected, canary) {
             if (ctx === 'script') {
                 payload = `'"></stYle/</titLe/</teXtarEa/</scRipt/--!><svg id=${key} onload=rsjsstorage.alertfunc(this.id)>`;
             } else {
-                payload = `'"></stYle/</titLe/</teXtarEa/</scRipt/--!><svg/onload="rsjsstorage.alertfunc('${key}')">`;
+                payload = `'"></stYle/</titLe/</teXtarEa/</scRipt/--!><svg/onload=rsjsstorage.alertfunc('${key}')>`;
             }
             results.push({ key, sink: 'reflected_' + ctx, ctx: 'html', payload });
         }
@@ -591,15 +593,24 @@ function get_payloads(sink, canary) {
             if (code === `<${canary}${key}>`) {
                 payload = `<img/src/onerror=rsjsstorage.alertfunc('${key}')>`;
             } else {
+                // Handlers must be quote-free: values that land inside a
+                // <script> JSON blob (e.g. ad "slot-data" markup serialized
+                // with JSON.stringify) arrive with every " escaped to \", so
+                // onerror="fn('k')" parses as an unquoted value starting with
+                // a backslash and the fired handler is a JS syntax error.
+                // Unquoted onerror=fn('k') — no spaces, single quotes survive
+                // JSON untouched — fires in both plain-HTML and JSON-string
+                // contexts. Same rationale as the reflected script payload's
+                // this.id trick. (Mirrors mthook.py.)
                 const htmlCtx = detect_html_context(code, canary, key);
                 if (htmlCtx === 'unquoted') {
-                    payload = `></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror="rsjsstorage.alertfunc('${key}')">`;
+                    payload = `></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=rsjsstorage.alertfunc('${key}')>`;
                 } else if (htmlCtx === 'single') {
-                    payload = `'></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror="rsjsstorage.alertfunc('${key}')">`;
+                    payload = `'></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=rsjsstorage.alertfunc('${key}')>`;
                 } else if (htmlCtx === 'double') {
-                    payload = `"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror="rsjsstorage.alertfunc('${key}')">`;
+                    payload = `"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=rsjsstorage.alertfunc('${key}')>`;
                 } else {
-                    payload = `'"></stYle/</titLe/</teXtarEa/</scRipt/--!><img/src/onerror="rsjsstorage.alertfunc('${key}')">`;
+                    payload = `'"></stYle/</titLe/</teXtarEa/</scRipt/--!><img/src/onerror=rsjsstorage.alertfunc('${key}')>`;
                 }
             }
             results.push({ key, sink: stype, ctx: 'html', payload });
@@ -657,10 +668,11 @@ async function stage2Route(route, request) {
     try { await route.continue(); } catch { /* ignore */ }
 }
 
-async function process_url_stage2(context, url, payloads) {
+async function process_url_stage2(context, url, payloads, beat = () => {}) {
     // Reload the same URL with canary params, but preload_inject.js returns
     // payload values via USP hooks and hash.
     if (!payloads.length) return [];
+    beat();
     const inject_script = build_inject_js(payloads);
     url = inject_canary_params(url, config.canary);
     const hasHashPayload = payloads.some(p => p.key === '_hash');
@@ -673,6 +685,7 @@ async function process_url_stage2(context, url, payloads) {
         try {
             await page.goto(target_url, { timeout: 10000, waitUntil: 'commit' });
         } catch { /* timeout ok */ }
+        beat();
         const expected = payloads.length;
         try {
             await page.waitForFunction(
@@ -684,11 +697,13 @@ async function process_url_stage2(context, url, payloads) {
                 // pages with sinks). Mirrors mthook.py.
                 expected, { timeout: 5000 });
         } catch { /* timeout ok */ }
+        beat();
         const js_evals = await page.evaluate(
             () => (window.rsjsstorage ? window.rsjsstorage.jsEvals : null));
         const evals = js_evals || [];
         return payloads.filter(p => evals.includes(p.key));
     } catch (e) {
+        if (isClosedError(e)) throw e;  // dead browser: exit fast, let the worker recycle
         eprint(`[stage2 error] ${target_url} ${e}`);
         return [];
     } finally {
@@ -696,18 +711,20 @@ async function process_url_stage2(context, url, payloads) {
     }
 }
 
-async function process_url_stage2_reflected(context, base_url, payloads) {
+async function process_url_stage2_reflected(context, base_url, payloads, beat = () => {}) {
     // Confirm server-side reflected XSS by navigating with the payload as the
     // raw query value (no JS hooks — the server has to be doing the reflection
     // for execution to fire).
     if (!payloads.length) return [];
     const confirmed = [];
     for (const p of payloads) {
+        beat();  // payloads legitimately take minutes in aggregate — keep the stall clock fresh
         const target_url = build_payload_url(base_url, p.key, p.payload);
         let page;
         try {
             page = await context.newPage();
         } catch (e) {
+            if (isClosedError(e)) throw e;  // dead browser: stop, don't burn the remaining payloads
             eprint(`[stage2-reflected new_page] ${target_url} ${e}`);
             continue;
         }
@@ -716,6 +733,7 @@ async function process_url_stage2_reflected(context, base_url, payloads) {
             try {
                 await page.goto(target_url, { timeout: 10000, waitUntil: 'commit' });
             } catch { /* timeout ok */ }
+            beat();
             try {
                 await page.waitForFunction(
                     (k) => window.rsjsstorage && window.rsjsstorage.jsEvals.includes(k),
@@ -727,6 +745,7 @@ async function process_url_stage2_reflected(context, base_url, payloads) {
                 () => (window.rsjsstorage ? window.rsjsstorage.jsEvals : null)) || [];
             if (js_evals.includes(p.key)) confirmed.push(p);
         } catch (e) {
+            if (isClosedError(e)) throw e;  // dead browser: stop, don't burn the remaining payloads
             eprint(`[stage2-reflected error] ${target_url} ${e}`);
         } finally {
             try { await page.close(); } catch { /* ignore */ }
@@ -754,7 +773,7 @@ function is_html_content_type(ct) {
     return HTML_CONTENT_TYPES.some((t) => v.includes(t));
 }
 
-async function process_url(context, url) {
+async function process_url(context, url, beat = () => {}) {
     const url_domain = netloc(url);
     if (domain_is_blocked(url_domain)) return;
 
@@ -854,14 +873,16 @@ async function process_url(context, url) {
 
         // Post-commit settle. 'load'/'domcontentloaded' never fire on pages
         // where an IIFE triggers a canary nav we 204; networkidle is safer
-        // because the 204 closes the request stream. Use stage1_wait when set,
-        // otherwise a short 300 ms window for inline JS to run.
-        if (stage1_wait) {
+        // because the 204 closes the request stream. Always wait for
+        // networkidle: a flat 300 ms read rsjsstorage before hydration
+        // finished, missing every sink that fires late (SPA/ad-slot innerHTML
+        // routinely lands 1-3 s after commit — e.g. finance.mail.ru
+        // slot-data). -w raises the window; default STAGE1_NETIDLE_MS.
+        {
+            const ms = stage1_wait ? Math.round(stage1_wait * 1000) : STAGE1_NETIDLE_MS;
             try {
-                await page.waitForLoadState('networkidle', { timeout: Math.round(stage1_wait * 1000) });
+                await page.waitForLoadState('networkidle', { timeout: ms });
             } catch { /* ignore */ }
-        } else {
-            await page.waitForTimeout(300);
         }
 
         // The target never actually loaded: a net-layer failure (connection
@@ -918,7 +939,7 @@ async function process_url(context, url) {
         let confirmed = [];
         if (payloads.length) {
             const static_confirmed = static_confirm_url_sinks(new_sinks, payloads, canary);
-            const stage2_confirmed = await process_url_stage2(context, url, payloads);
+            const stage2_confirmed = await process_url_stage2(context, url, payloads, beat);
             const seen = new Set();
             for (const p of static_confirmed.concat(stage2_confirmed)) {
                 const k = p.key + '\x00' + p.sink;
@@ -933,7 +954,7 @@ async function process_url(context, url) {
             const confirmedKeys = new Set(confirmed.map(c => c.key));
             reflected_payloads = reflected_payloads.filter(p => !confirmedKeys.has(p.key));
             if (reflected_payloads.length) {
-                for (const p of await process_url_stage2_reflected(context, url, reflected_payloads)) {
+                for (const p of await process_url_stage2_reflected(context, url, reflected_payloads, beat)) {
                     confirmed.push(p);
                 }
             }
@@ -1012,6 +1033,32 @@ function withTimeout(promise, ms, label) {
     return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
 
+// Race a task against a *stall* deadline: the clock restarts every time the
+// task reports progress via beat(). Same semantics as mthook.py's watchdog —
+// stage-2 verification legitimately runs for minutes on pages with many
+// sinks/reflected keys, but only while payloads keep completing, so the
+// ceiling must measure time WITHOUT progress, not total time. A fixed total
+// ceiling (the old worker race) killed healthy stage-2 loops at 60s and
+// discarded every unverified payload.
+function withStallTimeout(task, ms, label) {
+    let timer = null;
+    let done = false;
+    let expired;
+    const deadline = new Promise((_, reject) => { expired = reject; });
+    const beat = () => {
+        if (done) return;               // zombie task after the race settled: don't re-arm
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => expired(new Error(`hang timeout ${ms}ms: ${label}`)), ms);
+    };
+    const taskPromise = Promise.resolve().then(() => task(beat));
+    taskPromise.catch(() => { /* swallowed if it loses the race */ });
+    beat();
+    return Promise.race([taskPromise, deadline]).finally(() => {
+        done = true;
+        clearTimeout(timer);
+    });
+}
+
 async function closeQuietly(...items) {
     for (const it of items) {
         // Bound the close: a wedged browser can make close() hang too.
@@ -1044,11 +1091,14 @@ async function worker(queue) {
             if (url === undefined) break;
             if (processed >= BROWSER_REFRESH_INTERVAL) await recycle();
             try {
-                // Hard per-URL deadline: process_url handles its own routine
-                // errors, so anything reaching here is a crashed browser or a
-                // hang (renderer stuck in JS). Either way the context is suspect
-                // — recycle to a fresh browser before the next URL.
-                await withTimeout(process_url(context, url), URL_HANG_TIMEOUT, `process_url ${netloc(url)}`);
+                // Stall deadline per URL: process_url handles its own routine
+                // errors, and stage 2 beats while payloads complete, so this
+                // only fires on a crashed browser or a true hang (renderer
+                // stuck in JS — page.evaluate has no internal timeout).
+                // Either way the context is suspect — recycle to a fresh
+                // browser before the next URL.
+                await withStallTimeout((beat) => process_url(context, url, beat),
+                    URL_HANG_TIMEOUT, `process_url ${netloc(url)}`);
                 processed++;
             } catch (e) {
                 const why = isTimeoutError(e) ? 'hung' : 'browser closed';
@@ -1238,7 +1288,8 @@ function printHelp() {
 
   -u, --urls FILE        File containing URLs to process (else read stdin)
   -t, --threads N        Concurrent workers (default 10)
-  -w, --wait SECONDS     Seconds to wait (networkidle) after stage-1 load
+  -w, --wait SECONDS     Stage-1 networkidle window in seconds (default: 3s
+                         built in; raise for slow SPA/ad hydration)
   -o, --output FILE      File to write confirmed findings to (truncated)
   -d, --debug            Print unconfirmed sinks and reflected hits to stderr
   -D, --dedup            Enable per-domain sink/reflected deduplication

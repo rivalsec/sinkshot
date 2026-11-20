@@ -32,6 +32,7 @@ class _DropPipeClosedWarning(logging.Filter):
 logging.getLogger('asyncio').addFilter(_DropPipeClosedWarning())
 
 WORKER_TIMEOUT = 60  # seconds
+STAGE1_NETIDLE_MS = 3000  # default post-commit networkidle window when -w is not set
 BROWSER_REFRESH_INTERVAL = 50   # URLs per browser before recycle
 DRIVER_REFRESH_INTERVAL = 100   # URLs per playwright Node.js driver before full restart
 worker_state = {}  # wid -> {'last': float, 'browser': Browser}
@@ -319,7 +320,10 @@ def get_reflected_payloads(reflected, canary):
                 # this.id so no " appears in the event handler.
                 payload = f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><svg id={key} onload=rsjsstorage.alertfunc(this.id)>"
             else:
-                payload = f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><svg/onload=\"rsjsstorage.alertfunc('{key}')\">"
+                # Quote-free handler for the same reason (see get_payloads):
+                # survives JSON.stringify escaping if the reflection lands in
+                # a script-side JSON blob despite the html/attr context tag.
+                payload = f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><svg/onload=rsjsstorage.alertfunc('{key}')>"
             results.append({'key': key, 'sink': 'reflected_' + ctx, 'ctx': 'html', 'payload': payload})
     return results
 
@@ -503,15 +507,24 @@ def get_payloads(sink, canary):
                 results.append({'key': key, 'sink': stype, 'ctx': 'html',
                                 'payload': f"<img/src/onerror=rsjsstorage.alertfunc('{key}')>"})
             else:
+                # Handlers must be quote-free: values that land inside a
+                # <script> JSON blob (e.g. ad "slot-data" markup serialized
+                # with JSON.stringify) arrive with every " escaped to \", so
+                # onerror="fn('k')" parses as an unquoted value starting with
+                # a backslash and the fired handler is a JS syntax error.
+                # Unquoted onerror=fn('k') — no spaces, single quotes survive
+                # JSON untouched — fires in both plain-HTML and JSON-string
+                # contexts. Same rationale as the reflected script payload's
+                # this.id trick.
                 html_ctx = detect_html_context(code, canary, key)
                 if html_ctx == 'unquoted':
-                    payload = f"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=\"rsjsstorage.alertfunc('{key}')\">"
+                    payload = f"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=rsjsstorage.alertfunc('{key}')>"
                 elif html_ctx == 'single':
-                    payload = f"'></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=\"rsjsstorage.alertfunc('{key}')\">"
+                    payload = f"'></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=rsjsstorage.alertfunc('{key}')>"
                 elif html_ctx == 'double':
-                    payload = f"\"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=\"rsjsstorage.alertfunc('{key}')\">"
+                    payload = f"\"></stYle/</titLe/</teXtarEa/</scRipt/--!><img src=x onerror=rsjsstorage.alertfunc('{key}')>"
                 else:
-                    payload = f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><img/src/onerror=\"rsjsstorage.alertfunc('{key}')\">"
+                    payload = f"'\"></stYle/</titLe/</teXtarEa/</scRipt/--!><img/src/onerror=rsjsstorage.alertfunc('{key}')>"
                 results.append({'key': key, 'sink': stype, 'ctx': 'html', 'payload': payload})
 
         elif stype.startswith('setAttribute_'):
@@ -861,15 +874,17 @@ def process_url(context, url, heartbeat=None):
             # Post-commit settle: 'load' and 'domcontentloaded' never fire on
             # pages where the IIFE triggers a canary nav that we 204; waiting
             # on them costs the full timeout. networkidle is safer because the
-            # 204 closes the request stream. Use stage1_wait when set,
-            # otherwise a short 300 ms window for inline JS to run.
-            if stage1_wait:
-                try:
-                    page.wait_for_load_state('networkidle', timeout=int(stage1_wait * 1000))
-                except Exception:
-                    pass
-            else:
-                page.wait_for_timeout(300)
+            # 204 closes the request stream. Always wait for networkidle: a
+            # flat 300 ms read rsjsstorage before hydration finished, missing
+            # every sink that fires late (SPA/ad-slot innerHTML routinely lands
+            # 1-3 s after commit — e.g. finance.mail.ru slot-data). -w raises
+            # the window; the default is STAGE1_NETIDLE_MS.
+            try:
+                page.wait_for_load_state(
+                    'networkidle',
+                    timeout=int(stage1_wait * 1000) if stage1_wait else STAGE1_NETIDLE_MS)
+            except Exception:
+                pass
             beat()
             # The target never actually loaded: a net-layer failure (connection
             # reset, cert error, DNS/unsafe port...) lands Chromium on
@@ -1195,7 +1210,7 @@ def main():
     parser = argparse.ArgumentParser(description="Process URLs with DOMScan.")
     parser.add_argument('-u','--urls', help="File containing URLs to process")
     parser.add_argument('-t','--threads', type=int, default=10, help="Maximum number of threads to use")
-    parser.add_argument('-w','--wait', type=float, default=0, help="Seconds to wait after page load on stage 1")
+    parser.add_argument('-w','--wait', type=float, default=0, help="Stage-1 networkidle window in seconds (default: 3s built in; raise for slow SPA/ad hydration)")
     parser.add_argument('-o','--output', help="File to write confirmed findings to (truncated on open)")
     parser.add_argument('-d','--debug', action='store_true', help="Print unconfirmed sinks and reflected hits to stdout")
     parser.add_argument('-D','--dedup', action='store_true', help="Enable per-domain sink/reflected deduplication")
