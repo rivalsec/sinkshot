@@ -46,6 +46,27 @@ window.rsjsstorage.canary = rscanary
 // URL by pushState, so a later USP.get() pass-through stays bracketed.
 function rsCanaryValue(key) { return "<" + rscanary + key + ">"; }
 
+// Elements that received a canary (stage 1) or a payload (stage 2 — payloads
+// carry the rsjsstorage fingerprint) on a URL attribute. Polled at settle time
+// by the stage-2 DOM-presence check (DOM_PRESENT_JS in mthook.py/mthook.js):
+// a URL sink is only a real finding when such an element is still CONNECTED
+// and still carries the value. Classic FP shapes this kills: the detached
+// `<a>` used as a URL parser (`a = createElement('a'); a.href = v; return
+// a.pathname`), elements whose URL attributes are set before an async step
+// that fails (so they are never appended), and values the page rewrites or
+// drops once they don't look like its canary input. Kept OUTSIDE rsjsstorage
+// on purpose: elements must never end up in the object Python serializes.
+const rsUrlSinkEls = [];
+window.__rsUrlSinkEls = rsUrlSinkEls;
+const RS_URL_ATTRS = new Set(['href', 'src', 'action', 'formaction', 'xlink:href']);
+function rsTrackUrlSink(el, attr, value) {
+    let v;
+    try { v = String(value); } catch (e) { return; }
+    if (v.indexOf(rscanary) === -1 && v.indexOf('rsjsstorage') === -1) return;
+    rsUrlSinkEls.push([el, attr.toLowerCase()]);
+    if (rsUrlSinkEls.length > 1000) rsUrlSinkEls.shift();
+}
+
 //add params without reload
 const url = new URL(window.location.href);
 rstopparams = "{{topparams}}";
@@ -182,6 +203,7 @@ window.open = function (url, ...rest) {
 const actionDesc = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'action');
 Object.defineProperty(HTMLFormElement.prototype, 'action', {
     set(value) {
+        rsTrackUrlSink(this, 'action', value)
         window.rsjsstorage.addSink(String(value), "form_action")
         actionDesc.set.call(this, value);
     },
@@ -283,6 +305,8 @@ Object.defineProperty(HTMLScriptElement.prototype, 'text', {
 // setAttribute
 const originalSetAttribute = Element.prototype.setAttribute;
 Element.prototype.setAttribute = function (name, value) {
+    const sname = String(name);
+    if (RS_URL_ATTRS.has(sname.toLowerCase())) rsTrackUrlSink(this, sname, value);
     window.rsjsstorage.addSink(String(value), "setAttribute_" + (this.tagName || "").toLowerCase() + "_" + name);
     originalSetAttribute.call(this, name, value);
 };
@@ -295,6 +319,7 @@ srcElements.forEach(Ctor => {
     const tag = Ctor.prototype.constructor.name.replace('HTML', '').replace('Element', '').toLowerCase();
     Object.defineProperty(Ctor.prototype, 'src', {
         set(value) {
+            rsTrackUrlSink(this, 'src', value)
             window.rsjsstorage.addSink(String(value), tag + "_src")
             srcDesc.set.call(this, value);
         },
@@ -308,6 +333,7 @@ srcElements.forEach(Ctor => {
 const hrefDesc = Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype, 'href');
 Object.defineProperty(HTMLAnchorElement.prototype, 'href', {
     set(value) {
+        rsTrackUrlSink(this, 'href', value)
         window.rsjsstorage.addSink(String(value), "a_href")
         hrefDesc.set.call(this, value);
     },

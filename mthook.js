@@ -50,6 +50,61 @@ const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font']);
 const DOMAIN_MAX_ERRORS = 10;
 const BROWSER_REFRESH_INTERVAL = 50;  // URLs per browser before recycle (caps Chromium memory)
 const STAGE1_NETIDLE_MS = 3000;       // default post-commit networkidle window when -w is not set
+
+// --- crawl mode (-c DEPTH) state: JS is single-threaded between awaits, so
+// plain variables/Set suffice (no locks needed, unlike mthook.py). ---
+let crawl_depth = 0;              // 0 = off; else max link-follow depth
+let crawl_max_urls = 500;         // cap on total URLs scanned (seeds + discovered)
+const crawlHosts = new Set();     // seed hosts — crawl stays inside them
+const crawlSeen = new Set();      // URLs ever enqueued (dedup)
+let crawlEnqueued = 0;            // total enqueued, for the cap
+let crawlPending = 0;             // shifted but not yet link-harvested
+// Link targets pointless to scan as documents; the main-doc content-type check
+// would skip them anyway, this just saves the browser roundtrip.
+const CRAWL_SKIP_EXT = new Set(('jpg jpeg png gif webp svg ico bmp avif css js mjs map '
+    + 'mp4 webm mkv mov avi mp3 wav ogg flac woff woff2 ttf otf eot zip gz tgz bz2 7z '
+    + 'rar tar pdf doc docx xls xlsx ppt pptx csv').split(' '));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function crawlFilterLinks(links) {
+    // Keep http(s) links on a seed host, strip fragments, drop obvious asset
+    // URLs, dedupe. Cross-host links are ignored — the crawl stays on site.
+    const out = [];
+    const seen = new Set();
+    for (const h of (links || [])) {
+        let u;
+        try { u = new URL(h); } catch { continue; }
+        if ((u.protocol !== 'http:' && u.protocol !== 'https:') || !crawlHosts.has(u.host)) continue;
+        const ext = u.pathname.split('.').pop().toLowerCase();
+        if (CRAWL_SKIP_EXT.has(ext)) continue;
+        u.hash = '';
+        const s = u.toString();
+        if (!seen.has(s)) { seen.add(s); out.push(s); }
+    }
+    return out;
+}
+
+function crawlEnqueue(queue, urls, fromDepth) {
+    // Queue harvested links for scanning: depth-limited, deduped, capped.
+    // Links go to the TAIL of the FIFO queue, so the crawl is breadth-first —
+    // all depth-N pages are scanned before any depth-N+1 page. Each harvested
+    // batch is shuffled first (Fisher-Yates), so within a depth level the
+    // order (and thus what --max-urls keeps when it trims the deepest level)
+    // is random: repeat runs sample different pages instead of always
+    // drilling the same DOM order. (Mirrors mthook.py.)
+    if (crawl_depth <= 0 || fromDepth >= crawl_depth) return;
+    const arr = [...urls];
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    for (const u of arr) {
+        if (crawlSeen.has(u) || crawlEnqueued >= crawl_max_urls) continue;
+        crawlSeen.add(u);
+        crawlEnqueued++;
+        queue.push([u, fromDepth + 1]);
+    }
+}
 const URL_HANG_TIMEOUT = 60000;       // max time WITHOUT progress per URL (stage 2 beats as payloads
                                       // complete); page.evaluate() has no internal timeout, so a wedged
                                       // renderer (busy JS loop) would hang a worker forever
@@ -460,6 +515,77 @@ const URL_SINKS = new Set(['location_assign', 'location_replace', 'location_href
 const HTML_SINKS = new Set(['html']);
 const URL_ATTR_NAMES = new Set(['href', 'src', 'action', 'formaction']);
 
+// URL sinks with no element to look for in the DOM: the sink IS the navigation
+// (or the window.open call), so they stay statically confirmable when the
+// canary controls the whole URL. Every other URL sink writes an attribute on
+// an element and needs the DOM-presence check instead. (Mirrors mthook.py.)
+const NAV_URL_SINKS = new Set(['location_assign', 'location_replace', 'location_href',
+    'location_nav', 'window_open']);
+
+// Runs in the settled stage-2 page. A `javascript:` payload is only worth
+// reporting when it still sits at the START of a URL attribute on an element
+// connected to the live document — i.e. the PoC URL actually renders a link.
+// Starts-with (not substring) so share/self-URL embeds of the payload — which
+// land mid-URL, after `?param=` — don't count; that's the same URL-copy shape
+// filter_noise_sinks rejects. Two passes:
+//   1. walk the light DOM + open shadow roots for attribute carriers
+//      (<template> content is a separate inert fragment querySelectorAll never
+//      enters — exactly right: not rendered, not clickable);
+//   2. re-check the elements preload.js saw receive a canary/payload on a URL
+//      attribute (window.__rsUrlSinkEls): isConnected is true inside CLOSED
+//      shadow roots too, which pass 1 cannot enter, and re-reading the current
+//      attribute catches sanitizers that neutralise the value later.
+// Declared as a real function, not a string: Playwright's Node client
+// evaluates a string as a bare expression (never calling it, so the arg would
+// be lost), unlike the Python binding. Must stay self-contained — it is
+// serialized into the page. (Mirrors DOM_PRESENT_JS in mthook.py.)
+function dom_present_in_page(wanted) {
+    const URL_ATTRS = new Set(['href', 'src', 'action', 'formaction', 'xlink:href']);
+    function carries(v) {
+        if (typeof v !== 'string' || !v) return null;
+        const t = v.replace(/^\s+/, '');
+        for (const w of wanted) if (t === w || t.startsWith(w)) return w;
+        return null;
+    }
+    const hits = new Set();
+    (function scan(root) {
+        for (const el of root.querySelectorAll('*')) {
+            for (const a of el.attributes) {
+                if (!URL_ATTRS.has(a.name.toLowerCase())) continue;
+                const w = carries(a.value);
+                if (w) hits.add(w);
+            }
+            if (el.shadowRoot) scan(el.shadowRoot);
+        }
+    })(document);
+    for (const pair of (window.__rsUrlSinkEls || [])) {
+        const el = pair && pair[0], attr = pair && pair[1];
+        if (!el || !attr || !el.isConnected) continue;
+        let v;
+        try { v = el.getAttribute(attr); } catch (e) { v = null; }
+        if (v === null || v === undefined) {
+            try { v = el[attr === 'xlink:href' ? 'href' : attr]; } catch (e) { v = null; }
+        }
+        const w = carries(v);
+        if (w) hits.add(w);
+    }
+    return Array.from(hits);
+}
+
+function isElementUrlSink(stype) {
+    // True for URL sinks that write an attribute on an element (a_href, *_src,
+    // form_action, setAttribute_<urlattr>) — as opposed to navigation sinks
+    // (location_*, window_open) that act by themselves. (Mirrors
+    // is_element_url_sink in mthook.py.)
+    if (URL_SINKS.has(stype) && !NAV_URL_SINKS.has(stype)) return true;
+    if (stype.startsWith('setAttribute_')) {
+        const parts = stype.split('_');
+        const attr = parts.length > 2 ? parts.slice(2).join('_') : '';
+        return URL_ATTR_NAMES.has(attr);
+    }
+    return false;
+}
+
 function jsKeyArg(key) {
     // A quote-free JS expression evaluating to `key`. Chromium's URL parser
     // percent-encodes ' " ` (and < > space) in query and fragment, so a
@@ -541,26 +667,34 @@ function is_url_exploitable(code, canary, key) {
     return false;
 }
 
-function static_confirm_url_sinks(new_sinks, payloads, canary) {
-    // For URL sinks where canary+key controls the URL value (start or netloc),
-    // return matching payload entries so they can be confirmed without stage 2
-    // (which can't auto-click <a>/<form>).
+function confirm_url_sinks(new_sinks, payloads, dom_payloads, canary) {
+    // Confirm URL sinks stage 2 cannot auto-trigger (no real click):
+    // - navigation sinks (location_*, window_open): statically, when the canary
+    //   controls the whole URL value — these act by themselves, there is no
+    //   element to look for (open-redirect / javascript: navigation leads);
+    // - element URL sinks (a_href, *_src, form_action, setAttribute_<urlattr>):
+    //   only when stage 2 found the payload at the start of a URL attribute of
+    //   an element still connected in the settled DOM (dom_payloads, see
+    //   DOM_PRESENT_JS). A `javascript:` URL nobody can click is not a finding:
+    //   detached <a> URL-parsers, elements discarded when a later async step
+    //   fails, and values the page rewrites for non-canary input all stop here.
+    // Both paths keep the is_url_exploitable gate (full-value control), so a
+    // mid-URL canary never confirms. Element hits come back with via='dom'.
+    // (Mirrors confirm_url_sinks in mthook.py.)
     const confirmed = [];
     for (const s of new_sinks) {
         const stype = s.sink;
-        const isUrlSink = URL_SINKS.has(stype);
-        let isUrlAttr = false;
-        if (stype.startsWith('setAttribute_')) {
-            const parts = stype.split('_');
-            const attr = parts.length > 2 ? parts.slice(2).join('_') : '';
-            isUrlAttr = URL_ATTR_NAMES.has(attr);
-        }
-        if (!(isUrlSink || isUrlAttr)) continue;
+        const element_based = isElementUrlSink(stype);
+        if (!(element_based || URL_SINKS.has(stype))) continue;
+        const pool = element_based ? dom_payloads : payloads;
         const code = s.code || '';
         for (const key of (s.sources || [])) {
             if (!is_url_exploitable(code, canary, key)) continue;
-            for (const p of payloads) {
-                if (p.key === key && p.sink === stype) { confirmed.push(p); break; }
+            for (const p of pool) {
+                if (p.key === key && p.sink === stype) {
+                    confirmed.push(element_based ? { ...p, via: 'dom' } : p);
+                    break;
+                }
             }
         }
     }
@@ -648,7 +782,7 @@ function emit_confirmed(base_url, confirmed) {
     for (const c of confirmed) {
         const payload = c.payload.split('rsjsstorage.alertfunc').join('alert');
         const poc = build_payload_url(base_url, c.key, payload);
-        const line = `${poc}  [sink=${c.sink} ctx=${c.ctx}]`;
+        const line = `${poc}  [sink=${c.sink} ctx=${c.ctx}]${c.via ? ` via=${c.via}` : ''}`;
         process.stdout.write(line + '\n');
         if (outputStream) outputStream.write(line + '\n');
     }
@@ -670,8 +804,11 @@ async function stage2Route(route, request) {
 
 async function process_url_stage2(context, url, payloads, beat = () => {}) {
     // Reload the same URL with canary params, but preload_inject.js returns
-    // payload values via USP hooks and hash.
-    if (!payloads.length) return [];
+    // payload values via USP hooks and hash. Returns [execConfirmed,
+    // domPresent]: payload dicts whose alertfunc actually fired, and URL
+    // payloads whose value was found on a connected element's URL attribute
+    // in the settled DOM (see DOM_PRESENT_JS). (Mirrors mthook.py.)
+    if (!payloads.length) return [[], []];
     beat();
     const inject_script = build_inject_js(payloads);
     url = inject_canary_params(url, config.canary);
@@ -713,11 +850,29 @@ async function process_url_stage2(context, url, payloads, beat = () => {}) {
         const js_evals = await page.evaluate(
             () => (window.rsjsstorage ? window.rsjsstorage.jsEvals : null));
         const evals = js_evals || [];
-        return payloads.filter(p => evals.includes(p.key));
+        const confirmed = payloads.filter(p => evals.includes(p.key));
+        // DOM presence of the URL payloads — the confirmation for element URL
+        // sinks, which stage 2 can't click. Checked on the settled page so the
+        // same SPA hydration that delays alertfunc delays the link too. A
+        // navigation happening right at the end (context destroyed) must not
+        // throw away the exec results already collected. (Mirrors mthook.py.)
+        let dom_present = [];
+        const url_payloads = payloads.filter(p => p.ctx === 'url');
+        if (url_payloads.length) {
+            try {
+                const hits = new Set(await page.evaluate(dom_present_in_page,
+                    url_payloads.map(p => p.payload)) || []);
+                dom_present = url_payloads.filter(p => hits.has(p.payload));
+            } catch (e) {
+                if (isClosedError(e)) throw e;
+                eprint(`[stage2 dom-check] ${target_url} ${e}`);
+            }
+        }
+        return [confirmed, dom_present];
     } catch (e) {
         if (isClosedError(e)) throw e;  // dead browser: exit fast, let the worker recycle
         eprint(`[stage2 error] ${target_url} ${e}`);
-        return [];
+        return [[], []];
     } finally {
         try { await page.close(); } catch { /* ignore */ }
     }
@@ -793,7 +948,7 @@ function is_html_content_type(ct) {
     return HTML_CONTENT_TYPES.some((t) => v.includes(t));
 }
 
-async function process_url(context, url, beat = () => {}) {
+async function process_url(context, url, beat = () => {}, linksOut = null) {
     const url_domain = netloc(url);
     if (domain_is_blocked(url_domain)) return;
 
@@ -920,6 +1075,18 @@ async function process_url(context, url, beat = () => {}) {
             return;
         }
 
+        // Crawl: harvest same-site links from the rendered DOM now — after
+        // the networkidle settle (SPA routers have emitted their <a>s) but
+        // before any early return below, so every successfully landed page
+        // contributes links even if it yields no sinks. (Mirrors mthook.py.)
+        if (linksOut) {
+            try {
+                const hrefs = await page.evaluate(() => Array.from(
+                    document.querySelectorAll('a[href]')).map((a) => a.href));
+                linksOut.push(...(hrefs || []));
+            } catch { /* page navigated on; links are best-effort */ }
+        }
+
         const rsjsstorage = await page.evaluate(() => window.rsjsstorage);
         if (!rsjsstorage) {
             eprint(`[${url_domain}] no rsjsstorage (preload didn't run; page at ${page.url()})`);
@@ -958,12 +1125,26 @@ async function process_url(context, url, beat = () => {}) {
         for (const s of new_sinks) payloads.push(...get_payloads(s, canary));
         let confirmed = [];
         if (payloads.length) {
-            const static_confirmed = static_confirm_url_sinks(new_sinks, payloads, canary);
-            const stage2_confirmed = await process_url_stage2(context, url, payloads, beat);
+            const [exec_confirmed, dom_payloads] = await process_url_stage2(context, url, payloads, beat);
+            const url_confirmed = confirm_url_sinks(new_sinks, payloads, dom_payloads, canary);
             const seen = new Set();
-            for (const p of static_confirmed.concat(stage2_confirmed)) {
+            for (const p of exec_confirmed.concat(url_confirmed)) {
                 const k = p.key + '\x00' + p.sink;
                 if (!seen.has(k)) { seen.add(k); confirmed.push(p); }
+            }
+            if (debug_mode) {
+                const confPairs = new Set(confirmed.map(c => c.key + '\x00' + c.sink));
+                for (const s of new_sinks) {
+                    if (!isElementUrlSink(s.sink)) continue;
+                    const dropped = (s.sources || []).filter(k =>
+                        is_url_exploitable(s.code || '', canary, k)
+                        && !confPairs.has(k + '\x00' + s.sink));
+                    if (dropped.length) {
+                        eprint(`[url-sink unconfirmed] ${s.sink} key(s) [${dropped.join(', ')}] on ${current_url}: `
+                            + `payload not on any URL attribute of a connected element in the settled DOM `
+                            + `(detached/discarded element or value rewritten)`);
+                    }
+                }
             }
         }
 
@@ -1107,8 +1288,16 @@ async function worker(queue) {
     };
     try {
         while (true) {
-            const url = queue.shift();
-            if (url === undefined) break;
+            const item = queue.shift();
+            if (item === undefined) {
+                // Crawl-safe idle exit: crawlPending > 0 means another worker
+                // is mid-URL and may still push the links it harvested.
+                if (crawlPending === 0) break;
+                await sleep(250);
+                continue;
+            }
+            const [url, depth] = item;
+            crawlPending++;
             if (processed >= BROWSER_REFRESH_INTERVAL) await recycle();
             try {
                 // Stall deadline per URL: process_url handles its own routine
@@ -1117,13 +1306,18 @@ async function worker(queue) {
                 // stuck in JS — page.evaluate has no internal timeout).
                 // Either way the context is suspect — recycle to a fresh
                 // browser before the next URL.
-                await withStallTimeout((beat) => process_url(context, url, beat),
+                const links = [];
+                await withStallTimeout(
+                    (beat) => process_url(context, url, beat, crawl_depth > 0 ? links : null),
                     URL_HANG_TIMEOUT, `process_url ${netloc(url)}`);
+                crawlEnqueue(queue, crawlFilterLinks(links), depth);
                 processed++;
             } catch (e) {
                 const why = isTimeoutError(e) ? 'hung' : 'browser closed';
                 eprint(`[worker] ${why} on ${netloc(url)}, relaunching: ${e}`);
                 await recycle();
+            } finally {
+                crawlPending--;
             }
         }
     } finally {
@@ -1211,6 +1405,8 @@ async function main() {
                 output: { type: 'string', short: 'o' },
                 debug: { type: 'boolean', short: 'd' },
                 dedup: { type: 'boolean', short: 'D' },
+                crawl: { type: 'string', short: 'c' },
+                'max-urls': { type: 'string' },
                 header: { type: 'string', short: 'H', multiple: true },
                 ua: { type: 'string' },
                 session: { type: 'string' },
@@ -1234,6 +1430,12 @@ async function main() {
 
     const threads = args.threads ? parseInt(args.threads, 10) : 10;
     stage1_wait = args.wait ? parseFloat(args.wait) : 0;
+    crawl_depth = args.crawl ? (parseInt(args.crawl, 10) || 0) : 0;
+    crawl_max_urls = args['max-urls'] ? (parseInt(args['max-urls'], 10) || 500) : 500;
+    if (crawl_depth > 0) {
+        eprint(`[crawl] following same-host links up to depth ${crawl_depth}, `
+            + `max ${crawl_max_urls} URLs total`);
+    }
     debug_mode = !!args.debug;
     dedup = !!args.dedup;
     headed = !!args.headed;
@@ -1294,8 +1496,17 @@ async function main() {
         return;
     }
 
-    const queue = urls;  // workers .shift() from this shared array
-    const n = Math.max(1, Math.min(threads, urls.length));
+    const queue = [];  // workers .shift() [url, depth] from this shared array
+    for (const u of urls) {
+        if (crawlSeen.has(u)) continue;
+        crawlSeen.add(u);
+        crawlEnqueued++;
+        if (crawl_depth > 0) {
+            try { crawlHosts.add(new URL(u).host); } catch { /* malformed seed */ }
+        }
+        queue.push([u, 0]);
+    }
+    const n = Math.max(1, Math.min(threads, queue.length));
     const workers = [];
     for (let i = 0; i < n; i++) workers.push(worker(queue));  // each worker owns/recycles its browser
     await Promise.all(workers);
@@ -1314,6 +1525,10 @@ function printHelp() {
   -o, --output FILE      File to write confirmed findings to (truncated)
   -d, --debug            Print unconfirmed sinks and reflected hits to stderr
   -D, --dedup            Enable per-domain sink/reflected deduplication
+  -c, --crawl DEPTH      Crawl mode: harvest same-host links from every scanned
+                         page and scan them up to DEPTH levels deep (default off)
+      --max-urls N       Cap on total URLs scanned when crawling (default 500;
+                         seeds are always scanned)
   -H, --header "N: V"    Extra HTTP header sent on every request (repeatable)
       --ua UA            Override the User-Agent from config.yaml
       --session PATH     Load storageState JSON and keep cookies across URLs

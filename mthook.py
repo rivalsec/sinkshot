@@ -1,6 +1,7 @@
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote, unquote
 import os
+import random
 import re
 import signal
 import threading
@@ -47,6 +48,62 @@ domain_reflected_lock = threading.Lock()
 DOMAIN_MAX_ERRORS = 10
 domain_errors = {}
 domain_errors_lock = threading.Lock()
+
+# --- crawl mode (-c DEPTH) state -----------------------------------------
+crawl_depth = 0            # 0 = off; else max link-follow depth
+crawl_max_urls = 500       # cap on total URLs scanned (seeds + discovered)
+crawl_hosts = set()        # seed netlocs — crawl stays inside them
+crawl_seen = set()         # URLs ever enqueued (dedup across workers)
+crawl_enqueued = 0         # total enqueued, for the cap
+crawl_pending = 0          # dequeued but not yet link-harvested (crawl in flight)
+crawl_lock = threading.Lock()
+# Link targets pointless to scan as documents; the main-doc content-type check
+# would skip them anyway, this just saves the browser roundtrip.
+CRAWL_SKIP_EXT = frozenset(
+    'jpg jpeg png gif webp svg ico bmp avif css js mjs map mp4 webm mkv mov avi '
+    'mp3 wav ogg flac woff woff2 ttf otf eot zip gz tgz bz2 7z rar tar pdf doc '
+    'docx xls xlsx ppt pptx csv'.split())
+
+
+def crawl_filter_links(links):
+    """Keep http(s) links on a seed host, strip fragments, drop obvious asset
+    URLs, dedupe. Cross-host links are ignored — the crawl stays on site."""
+    out, seen = [], set()
+    for h in links or []:
+        try:
+            p = urlparse(h)
+        except Exception:
+            continue
+        if p.scheme not in ('http', 'https') or p.netloc not in crawl_hosts:
+            continue
+        if p.path.rsplit('.', 1)[-1].lower() in CRAWL_SKIP_EXT:
+            continue
+        u = urlunparse(p._replace(fragment=''))
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def crawl_enqueue(queue, urls, from_depth):
+    """Queue harvested links for scanning: depth-limited, deduped, capped.
+    Links go to the TAIL of the FIFO queue, so the crawl is breadth-first —
+    all depth-N pages are scanned before any depth-N+1 page. Each harvested
+    batch is shuffled first, so within a depth level the order (and thus what
+    --max-urls keeps when it trims the deepest level) is random: repeat runs
+    sample different pages instead of always drilling the same DOM order."""
+    global crawl_enqueued
+    if crawl_depth <= 0 or from_depth >= crawl_depth:
+        return
+    urls = list(urls)
+    random.shuffle(urls)
+    with crawl_lock:
+        for u in urls:
+            if u in crawl_seen or crawl_enqueued >= crawl_max_urls:
+                continue
+            crawl_seen.add(u)
+            crawl_enqueued += 1
+            queue.put((u, from_depth + 1))
 
 output_file = None
 output_lock = threading.Lock()
@@ -347,6 +404,60 @@ JS_SINKS = {'eval', 'func', 'setTimeout', 'setInterval', 'script_text'}
 URL_SINKS = {'location_assign', 'location_replace', 'location_href', 'location_nav', 'a_href', 'form_action', 'iframe_src', 'script_src', 'window_open'}
 HTML_SINKS = {'html'}
 
+# URL sinks with no element to look for in the DOM: the sink IS the navigation
+# (or the window.open call), so they stay statically confirmable when the
+# canary controls the whole URL. Every other URL sink writes an attribute on
+# an element and needs the DOM-presence check instead.
+NAV_URL_SINKS = {'location_assign', 'location_replace', 'location_href', 'location_nav', 'window_open'}
+
+# Runs in the settled stage-2 page. A `javascript:` payload is only worth
+# reporting when it still sits at the START of a URL attribute on an element
+# connected to the live document — i.e. the PoC URL actually renders a link.
+# Starts-with (not substring) so share/self-URL embeds of the payload — which
+# land mid-URL, after `?param=` — don't count; that's the same URL-copy shape
+# filter_noise_sinks rejects. Two passes:
+#   1. walk the light DOM + open shadow roots for attribute carriers
+#      (<template> content is a separate inert fragment querySelectorAll never
+#      enters — exactly right: not rendered, not clickable);
+#   2. re-check the elements preload.js saw receive a canary/payload on a URL
+#      attribute (window.__rsUrlSinkEls): isConnected is true inside CLOSED
+#      shadow roots too, which pass 1 cannot enter, and re-reading the current
+#      attribute catches sanitizers that neutralise the value later.
+DOM_PRESENT_JS = """
+(wanted) => {
+    const URL_ATTRS = new Set(['href', 'src', 'action', 'formaction', 'xlink:href']);
+    function carries(v) {
+        if (typeof v !== 'string' || !v) return null;
+        const t = v.replace(/^\\s+/, '');
+        for (const w of wanted) if (t === w || t.startsWith(w)) return w;
+        return null;
+    }
+    const hits = new Set();
+    (function scan(root) {
+        for (const el of root.querySelectorAll('*')) {
+            for (const a of el.attributes) {
+                if (!URL_ATTRS.has(a.name.toLowerCase())) continue;
+                const w = carries(a.value);
+                if (w) hits.add(w);
+            }
+            if (el.shadowRoot) scan(el.shadowRoot);
+        }
+    })(document);
+    for (const pair of (window.__rsUrlSinkEls || [])) {
+        const el = pair && pair[0], attr = pair && pair[1];
+        if (!el || !attr || !el.isConnected) continue;
+        let v;
+        try { v = el.getAttribute(attr); } catch (e) { v = null; }
+        if (v === null || v === undefined) {
+            try { v = el[attr === 'xlink:href' ? 'href' : attr]; } catch (e) { v = null; }
+        }
+        const w = carries(v);
+        if (w) hits.add(w);
+    }
+    return Array.from(hits);
+}
+"""
+
 def js_key_arg(key):
     """A quote-free JS expression evaluating to `key`. Chromium's URL parser
     percent-encodes ' " ` (and < > space) in query and fragment, so a payload
@@ -452,28 +563,51 @@ def is_url_exploitable(code, canary, key):
 URL_ATTR_NAMES = ('href', 'src', 'action', 'formaction')
 
 
-def static_confirm_url_sinks(new_sinks, payloads, canary):
-    """For URL sinks where canary+key controls the URL value (start or netloc),
-    return the matching payload entries so they can be marked confirmed without
-    waiting on stage 2 (which can't auto-click <a>/<form>)."""
+def is_element_url_sink(stype):
+    """True for URL sinks that write an attribute on an element (a_href,
+    *_src, form_action, setAttribute_<urlattr>) — as opposed to navigation
+    sinks (location_*, window_open) that act by themselves."""
+    if stype in URL_SINKS and stype not in NAV_URL_SINKS:
+        return True
+    if stype.startswith('setAttribute_'):
+        parts = stype.split('_', 2)
+        attr = parts[2] if len(parts) > 2 else ''
+        return attr in URL_ATTR_NAMES
+    return False
+
+
+def confirm_url_sinks(new_sinks, payloads, dom_payloads, canary):
+    """Confirm URL sinks stage 2 cannot auto-trigger (no real click):
+
+    - navigation sinks (location_*, window_open): statically, when the canary
+      controls the whole URL value — these act by themselves, there is no
+      element to look for (open-redirect / javascript: navigation leads);
+    - element URL sinks (a_href, *_src, form_action, setAttribute_<urlattr>):
+      only when stage 2 found the payload at the start of a URL attribute of
+      an element still connected in the settled DOM (dom_payloads, see
+      DOM_PRESENT_JS). A `javascript:` URL nobody can click is not a finding:
+      detached <a> URL-parsers, elements discarded when a later async step
+      fails, and values the page rewrites for non-canary input all stop here.
+
+    Both paths keep the old is_url_exploitable gate (full-value control), so
+    a mid-URL canary never confirms. Element hits come back with via='dom'."""
     confirmed = []
     for s in new_sinks:
         stype = s['sink']
-        is_url_sink = stype in URL_SINKS
-        is_url_attr = False
-        if stype.startswith('setAttribute_'):
-            parts = stype.split('_', 2)
-            attr = parts[2] if len(parts) > 2 else ''
-            is_url_attr = attr in URL_ATTR_NAMES
-        if not (is_url_sink or is_url_attr):
+        element_based = is_element_url_sink(stype)
+        if not (element_based or stype in URL_SINKS):
             continue
+        pool = dom_payloads if element_based else payloads
         code = s.get('code', '')
         for key in s.get('sources', []):
             if not is_url_exploitable(code, canary, key):
                 continue
-            for p in payloads:
+            for p in pool:
                 if p['key'] == key and p['sink'] == stype:
-                    confirmed.append(p)
+                    entry = dict(p)
+                    if element_based:
+                        entry['via'] = 'dom'
+                    confirmed.append(entry)
                     break
     return confirmed
 
@@ -604,6 +738,8 @@ def emit_confirmed(base_url, confirmed):
         payload = c['payload'].replace('rsjsstorage.alertfunc', 'alert')
         poc = build_payload_url(base_url, c['key'], payload)
         line = f"{poc}  [sink={c['sink']} ctx={c['ctx']}]"
+        if c.get('via'):
+            line += f" via={c['via']}"
         print(line)
         if output_file is not None:
             with output_lock:
@@ -612,10 +748,13 @@ def emit_confirmed(base_url, confirmed):
 
 def process_url_stage2(context, url, payloads, heartbeat=None):
     """Stage 2: reload the same URL with canary params, but preload_inject.js
-    returns payload values via USP hooks and hash."""
+    returns payload values via USP hooks and hash. Returns a tuple:
+    (exec_confirmed, dom_present) — payload dicts whose alertfunc actually
+    fired, and URL payloads whose value was found on a connected element's
+    URL attribute in the settled DOM (see DOM_PRESENT_JS)."""
     beat = heartbeat or (lambda: None)
     if not payloads:
-        return []
+        return [], []
     inject_script = build_inject_js(payloads)
     url = inject_canary_params(url, config['canary'])
     has_hash_payload = any(p['key'] == '_hash' for p in payloads)
@@ -672,12 +811,27 @@ def process_url_stage2(context, url, payloads, heartbeat=None):
         beat()
         js_evals = page.evaluate("() => window.rsjsstorage ? window.rsjsstorage.jsEvals : null")
         confirmed = [p for p in payloads if p['key'] in (js_evals or [])]
-        return confirmed
+        # DOM presence of the URL payloads — the confirmation for element URL
+        # sinks, which stage 2 can't click. Checked on the settled page so the
+        # same SPA hydration that delays alertfunc delays the link too. A
+        # navigation happening right at the end (context destroyed) must not
+        # throw away the exec results already collected.
+        dom_present = []
+        url_payloads = [p for p in payloads if p.get('ctx') == 'url']
+        if url_payloads:
+            try:
+                hits = set(page.evaluate(DOM_PRESENT_JS, arg=[p['payload'] for p in url_payloads]) or [])
+                dom_present = [p for p in url_payloads if p['payload'] in hits]
+            except Exception as e:
+                if is_closed_error(e):
+                    raise
+                print(f"[stage2 dom-check] {target_url} {e}", file=sys.stderr)
+        return confirmed, dom_present
     except Exception as e:
         if is_closed_error(e):
             raise
         print(f"[stage2 error] {target_url} {e}", file=sys.stderr)
-        return []
+        return [], []
     finally:
         try:
             page.close()
@@ -788,7 +942,7 @@ def is_html_content_type(ct):
                                  'text/xml', 'application/xml'))
 
 
-def process_url(context, url, heartbeat=None):
+def process_url(context, url, heartbeat=None, links_out=None):
         beat = heartbeat or (lambda: None)
         url_domain = urlparse(url).netloc
         if domain_is_blocked(url_domain):
@@ -921,6 +1075,17 @@ def process_url(context, url, heartbeat=None):
                 if debug_mode:
                     print(f"[load failed] {url} (no document committed)", file=sys.stderr)
                 return
+            # Crawl: harvest same-site links from the rendered DOM now — after
+            # the networkidle settle (SPA routers have emitted their <a>s) but
+            # before any early return below, so every successfully landed page
+            # contributes links even if it yields no sinks.
+            if links_out is not None:
+                try:
+                    links_out.extend(page.evaluate(
+                        "() => Array.from(document.querySelectorAll('a[href]'))"
+                        ".map(a => a.href)") or [])
+                except Exception:
+                    pass
             rsjsstorage = page.evaluate("""() => {
                 return window.rsjsstorage
             }""")
@@ -962,14 +1127,26 @@ def process_url(context, url, heartbeat=None):
                 payloads.extend(get_payloads(s, config['canary']))
             confirmed = []
             if payloads:
-                static_confirmed = static_confirm_url_sinks(new_sinks, payloads, config['canary'])
-                stage2_confirmed = process_url_stage2(context, url, payloads, heartbeat=beat)
+                exec_confirmed, dom_payloads = process_url_stage2(context, url, payloads, heartbeat=beat)
+                url_confirmed = confirm_url_sinks(new_sinks, payloads, dom_payloads, config['canary'])
                 seen = set()
-                for p in static_confirmed + stage2_confirmed:
+                for p in exec_confirmed + url_confirmed:
                     k = (p['key'], p['sink'])
                     if k not in seen:
                         seen.add(k)
                         confirmed.append(p)
+                if debug_mode:
+                    conf_pairs = {(c['key'], c['sink']) for c in confirmed}
+                    for s in new_sinks:
+                        if not is_element_url_sink(s['sink']):
+                            continue
+                        dropped = [k for k in s.get('sources', [])
+                                   if is_url_exploitable(s.get('code', ''), config['canary'], k)
+                                   and (k, s['sink']) not in conf_pairs]
+                        if dropped:
+                            print(f"[url-sink unconfirmed] {s['sink']} key(s) {dropped} on {current_url}: "
+                                  f"payload not on any URL attribute of a connected element in the settled DOM "
+                                  f"(detached/discarded element or value rewritten)", file=sys.stderr)
 
             # Stage 2 (reflected): server-side reflected XSS — navigate with
             # payload directly in the query and check for alertfunc execution.
@@ -1011,6 +1188,7 @@ def process_url(context, url, heartbeat=None):
 
 
 def worker(wid, queue: Queue, done_event: threading.Event):
+    global crawl_pending
     with worker_state_lock:
         worker_state.setdefault(wid, {'last': time.time(), 'node_pid': None})
 
@@ -1065,23 +1243,33 @@ def worker(wid, queue: Queue, done_event: threading.Event):
                 driver_urls = 0  # per-driver URL count
                 while True:
                     try:
-                        url = queue.get(timeout=1)
+                        url, depth = queue.get(timeout=1)
                     except Exception:
-                        if done_event.is_set() and queue.empty():
+                        # Crawl-safe idle exit: crawl_pending > 0 means another
+                        # worker is mid-URL and may still push harvested links.
+                        if done_event.is_set() and queue.empty() and crawl_pending == 0:
                             break
                         continue
+                    with crawl_lock:
+                        crawl_pending += 1
                     with worker_state_lock:
                         if wid in worker_state:
                             worker_state[wid]['last'] = time.time()
                             worker_state[wid]['url'] = url
                     try:
-                        process_url(context, url, heartbeat=heartbeat)
+                        links = []
+                        process_url(context, url, heartbeat=heartbeat,
+                                    links_out=links if crawl_depth > 0 else None)
+                        crawl_enqueue(queue, crawl_filter_links(links), depth)
                     except Exception as e:
                         if is_closed_error(e):
                             print(f"[worker {wid}] driver/browser closed on {url}, restarting driver", file=sys.stderr)
                             restart_driver = True
                             break
                         print(f"[worker {wid}] process_url: {e}", file=sys.stderr)
+                    finally:
+                        with crawl_lock:
+                            crawl_pending -= 1
                     with worker_state_lock:
                         if wid in worker_state:
                             worker_state[wid]['url'] = None
@@ -1174,7 +1362,7 @@ def watchdog(queue, next_wid_holder, target_workers, stop_event, done_event):
             spawn_worker()
         # Top up workers that died on their own (e.g. browser crash, OOM, exception).
         # Skip when work is drained — those workers exited normally.
-        work_remaining = not (done_event.is_set() and queue.empty())
+        work_remaining = not (done_event.is_set() and queue.empty() and crawl_pending == 0)
         if work_remaining:
             with worker_state_lock:
                 deficit = target_workers - len(worker_state)
@@ -1182,7 +1370,7 @@ def watchdog(queue, next_wid_holder, target_workers, stop_event, done_event):
                 print(f"[watchdog] worker died unexpectedly, spawning replacement", file=sys.stderr)
                 spawn_worker()
         # exit only after stdin/file is fully ingested AND queue drained AND no workers left
-        if done_event.is_set() and queue.empty():
+        if done_event.is_set() and queue.empty() and crawl_pending == 0:
             with worker_state_lock:
                 if not worker_state:
                     return
@@ -1226,6 +1414,7 @@ def capture_session(url, path, ua, viewport=None):
 
 def main():
     global preloadjs, injectjs, stage1_wait, output_file, debug_mode, dedup, extra_headers, storage_state_path, headed, viewport
+    global crawl_depth, crawl_max_urls
     preloadjs = getPreloadJS()
     injectjs = getInjectJS()
     with open("js/preload_debug.js", "w") as f:
@@ -1238,6 +1427,10 @@ def main():
     parser.add_argument('-o','--output', help="File to write confirmed findings to (truncated on open)")
     parser.add_argument('-d','--debug', action='store_true', help="Print unconfirmed sinks and reflected hits to stdout")
     parser.add_argument('-D','--dedup', action='store_true', help="Enable per-domain sink/reflected deduplication")
+    parser.add_argument('-c','--crawl', type=int, default=0, metavar='DEPTH',
+                        help="Crawl mode: harvest same-host links from every scanned page and scan them up to DEPTH levels deep (default off)")
+    parser.add_argument('--max-urls', type=int, default=500, metavar='N',
+                        help="Cap on total URLs scanned when crawling (default 500; seeds are always scanned)")
     parser.add_argument('-H','--header', action='append', default=[],
                         help='Extra HTTP header "Name: Value" sent on every request (repeatable)')
     parser.add_argument('--ua', help="Override the User-Agent from config.yaml (use the same value for capture and scan)")
@@ -1258,6 +1451,11 @@ def main():
         except ValueError:
             parser.error(f"--viewport expects WxH (e.g. 430x932), got: {args.viewport}")
     stage1_wait = args.wait
+    crawl_depth = args.crawl or 0
+    crawl_max_urls = args.max_urls or 500
+    if crawl_depth > 0:
+        print(f"[crawl] following same-host links up to depth {crawl_depth}, "
+              f"max {crawl_max_urls} URLs total", file=sys.stderr)
     debug_mode = args.debug
     dedup = args.dedup
     if args.ua:
@@ -1282,10 +1480,27 @@ def main():
     queue = Queue()
     done_event = threading.Event()
 
+    def feed(url):
+        """Register a seed URL (dedup + crawl bookkeeping) and queue it at depth 0."""
+        global crawl_enqueued
+        if not url:
+            return
+        with crawl_lock:
+            if url in crawl_seen:
+                return
+            crawl_seen.add(url)
+            crawl_enqueued += 1
+            if crawl_depth > 0:
+                try:
+                    crawl_hosts.add(urlparse(url).netloc)
+                except Exception:
+                    pass
+            queue.put((url, 0))
+
     if args.urls:
         with open(args.urls, 'r') as file:
             for url in file:
-                queue.put(url.strip())
+                feed(url.strip())
         done_event.set()
 
     next_wid_holder = [args.threads]
@@ -1299,9 +1514,7 @@ def main():
 
     if not args.urls:
         for url in sys.stdin:
-            url = url.strip()
-            if url:
-                queue.put(url)
+            feed(url.strip())
         done_event.set()
 
     wd.join()
