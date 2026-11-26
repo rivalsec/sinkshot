@@ -354,6 +354,21 @@ function find_reflected_canaries(raw_html, canary) {
         return results;
     }
 
+    // HTML parsers lowercase tag names, so a raw-reflected `<canary+Key>`
+    // surfaces below as a lowercased tag (rivalssscontactMsg ->
+    // rivalssscontactmsg) while the raw body still holds the key's true
+    // case. Build lower->original once and restore it on tag-name hits, or
+    // stage 2 delivers the payload as &contactmsg=... — a param the server
+    // never reads, so mixed-case reflected keys can never confirm. Text
+    // and attribute values keep their case through the parse (and reflect
+    // what the server actually emits), so they are NOT remapped.
+    const origCase = new Map();
+    for (const k of keysFrom(raw_html, rgx)) {
+        const low = k.toLowerCase();
+        if (!origCase.has(low)) origCase.set(low, k);
+    }
+    const orig = (k) => origCase.get(k.toLowerCase()) || k;
+
     function walk(node) {
         for (const child of (node.childNodes || [])) {
             if (isElement(child)) {
@@ -361,7 +376,9 @@ function find_reflected_canaries(raw_html, canary) {
 
                 // tag name itself matches canary — `<canary+key>` reflected
                 // unescaped into HTML body and parsed as an unknown element.
-                const tagKeys = keysFrom(tag, rgx);
+                // The parser lowercased the name; restore the key's
+                // original case.
+                const tagKeys = uniq(keysFrom(tag, rgx).map(orig));
                 if (tagKeys.length) {
                     const parent = child.parentNode;
                     const parentTag = (parent && parent.tagName)
