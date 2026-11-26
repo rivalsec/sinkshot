@@ -1150,8 +1150,48 @@ async function process_url(context, url, beat = () => {}, linksOut = null) {
         // contributes links even if it yields no sinks. (Mirrors mthook.py.)
         if (linksOut) {
             try {
-                const hrefs = await page.evaluate(() => Array.from(
-                    document.querySelectorAll('a[href]')).map((a) => a.href));
+                const hrefs = await page.evaluate(() => {
+                    const out = Array.from(document.querySelectorAll('a[href]'))
+                        .map((a) => a.href);
+                    // GET forms: a param the site only reads from a form
+                    // field is invisible to link harvesting, and topparams
+                    // pushState can't feed the server (it rewrites the URL
+                    // client-side AFTER the document was fetched). Probe
+                    // the action URL with each control's name instead —
+                    // inject_canary_params turns the values into canaries
+                    // at scan time and the reflection/stage-2 pipeline
+                    // handles the rest. GET only: a POST param can't ride
+                    // a URL, so no PoC could be emitted. Per the HTML
+                    // spec a GET submit REPLACES the action's query with
+                    // the form data, so replace here too (and a
+                    // no-action form submits to the current URL — its
+                    // pushState'd topparams drop, which is faithful).
+                    // (Mirrors mthook.py.)
+                    for (const f of document.querySelectorAll('form')) {
+                        const method =
+                            (f.getAttribute('method') || 'get').toUpperCase();
+                        if (method !== 'GET') continue;
+                        let action;
+                        try {
+                            action = new URL(f.getAttribute('action') || location.href,
+                                             location.href);
+                        } catch (e) { continue; }
+                        if (action.protocol !== 'http:' && action.protocol !== 'https:') continue;
+                        if (action.origin !== location.origin) continue;
+                        const names = [];
+                        for (const el of f.elements) {
+                            if (!el.name || names.indexOf(el.name) !== -1) continue;
+                            const t = (el.getAttribute('type') || el.tagName).toLowerCase();
+                            if (t === 'submit' || t === 'button' || t === 'reset'
+                                || t === 'image' || t === 'file') continue;
+                            names.push(el.name);
+                        }
+                        if (!names.length) continue;
+                        action.search = names.map((n) => n + '=x').join('&');
+                        out.push(action.href);
+                    }
+                    return out;
+                });
                 linksOut.push(...(hrefs || []));
             } catch { /* page navigated on; links are best-effort */ }
         }
