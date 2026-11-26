@@ -1147,7 +1147,7 @@ def process_url(context, url, heartbeat=None, links_out=None):
             # contributes links even if it yields no sinks.
             if links_out is not None:
                 try:
-                    links_out.extend(page.evaluate("""() => {
+                    links_out.extend(page.evaluate(r"""() => {
                         const out = Array.from(document.querySelectorAll('a[href]'))
                             .map(a => a.href);
                         // GET forms: a param the site only reads from a form
@@ -1185,6 +1185,36 @@ def process_url(context, url, heartbeat=None, links_out=None):
                             if (!names.length) continue;
                             action.search = names.map(n => n + '=x').join('&');
                             out.push(action.href);
+                        }
+                        // onclick-only navigation: some targets are reachable
+                        // ONLY through event handlers — button
+                        // onclick="location.assign('/hidden/vault?token=x')",
+                        // href-less <a onclick="location.href='...'">. No
+                        // a[href] ever carries them, so mine on* handler
+                        // attributes for literal navigation targets:
+                        // location.assign/replace calls, window.open calls,
+                        // and location[.href] assignments. Concatenated
+                        // targets ('/x?' + q) stay out of reach — this is a
+                        // static harvest, no clicking. Resolved against the
+                        // current URL; non-http(s) results die in the same
+                        // on-site link filter below.
+                        for (const el of document.querySelectorAll('*')) {
+                            for (const attr of el.attributes) {
+                                if (!attr.name.startsWith('on') || !attr.value) continue;
+                                const src = attr.value;
+                                const targets = [];
+                                for (const re of [
+                                    /(?:window\s*\.\s*|document\s*\.\s*)?location\s*\.\s*(?:assign|replace)\s*\(\s*(['"])([^'"]+)\1/g,
+                                    /\bwindow\s*\.\s*open\s*\(\s*(['"])([^'"]+)\1/g,
+                                    /(?:window\s*\.\s*|document\s*\.\s*|parent\s*\.\s*|top\s*\.\s*)?location\s*(?:\.\s*href)?\s*=\s*(['"])([^'"]+)\1/g,
+                                ]) {
+                                    let m;
+                                    while ((m = re.exec(src)) !== null) targets.push(m[2]);
+                                }
+                                for (const t of targets) {
+                                    try { out.push(new URL(t, location.href).href); } catch (e) {}
+                                }
+                            }
                         }
                         return out;
                     }""") or [])
