@@ -763,18 +763,60 @@ def emit_confirmed(base_url, confirmed):
                 output_file.write(line + '\n')
 
 
+def partition_payload_rounds(payloads):
+    """Split payloads into delivery rounds. preload_inject.js ships payloads
+    as payloadMap {key: payload} — one value per param name — so two payloads
+    on one key (one param feeding eval AND innerHTML) clobber down to the
+    last one. The survivor reaches BOTH sinks, and a payload that is wrong
+    for the first sink can throw there (an html breakout inside an eval
+    argument is a SyntaxError) and kill the script before the second sink
+    runs — neither flow confirms. Round r carries each key's (r+1)-th
+    payload, so every key appears at most once per round and each round gets
+    its own stage-2 reload. Pages where all keys are distinct (the common
+    case) collapse to a single round, i.e. the previous behavior and cost.
+    As a side effect this also makes the jsEvals wait satisfiable (it is
+    deduped by key, so `length >= len(payloads)` could never reach 2 for two
+    payloads on one key) and the key-based confirmation sound (in a round
+    that ships only one payload for the key, the key in jsEvals can only
+    have come from that payload)."""
+    rounds = []
+    next_round = {}
+    for p in payloads:
+        r = next_round.get(p['key'], 0)
+        next_round[p['key']] = r + 1
+        while len(rounds) <= r:
+            rounds.append([])
+        rounds[r].append(p)
+    return rounds
+
+
 def process_url_stage2(context, url, payloads, heartbeat=None):
     """Stage 2: reload the same URL with canary params, but preload_inject.js
-    returns payload values via USP hooks and hash. Returns a tuple:
-    (exec_confirmed, dom_present) — payload dicts whose alertfunc actually
-    fired, and URL payloads whose value was found on a connected element's
-    URL attribute in the settled DOM (see DOM_PRESENT_JS)."""
+    returns payload values via USP hooks and hash. Payloads are delivered in
+    rounds (see partition_payload_rounds): one reload per round, at most one
+    payload per key per reload. Returns a tuple: (exec_confirmed, dom_present)
+    — payload dicts whose alertfunc actually fired, and URL payloads whose
+    value was found on a connected element's URL attribute in the settled DOM
+    (see DOM_PRESENT_JS)."""
     beat = heartbeat or (lambda: None)
     if not payloads:
         return [], []
-    inject_script = build_inject_js(payloads)
     url = inject_canary_params(url, config['canary'])
-    has_hash_payload = any(p['key'] == '_hash' for p in payloads)
+    confirmed_all = []
+    dom_present_all = []
+    for round_payloads in partition_payload_rounds(payloads):
+        confirmed, dom_present = _process_url_stage2_round(
+            context, url, round_payloads, beat)
+        confirmed_all += confirmed
+        dom_present_all += dom_present
+    return confirmed_all, dom_present_all
+
+
+def _process_url_stage2_round(context, url, round_payloads, beat):
+    """One stage-2 reload for a single delivery round (each key at most
+    once). Returns (confirmed, dom_present) for this round's payloads only."""
+    inject_script = build_inject_js(round_payloads)
+    has_hash_payload = any(p['key'] == '_hash' for p in round_payloads)
     target_url = url if has_hash_payload else url + f"#{config['canary']}_hash"
 
     page = context.new_page()
@@ -813,7 +855,11 @@ def process_url_stage2(context, url, payloads, heartbeat=None):
         except Exception:
             pass
         beat()
-        expected = len(payloads)
+        # All keys in a round are distinct (partition_payload_rounds), so
+        # this count is reachable: jsEvals dedupes by key, and each key can
+        # fire at most once here. With the old single-map delivery two
+        # payloads on one key made this wait unsatisfiable by construction.
+        expected = len(round_payloads)
         try:
             page.wait_for_function(
                 f"() => window.rsjsstorage && window.rsjsstorage.jsEvals.length >= {expected}",
@@ -827,14 +873,17 @@ def process_url_stage2(context, url, payloads, heartbeat=None):
             pass
         beat()
         js_evals = page.evaluate("() => window.rsjsstorage ? window.rsjsstorage.jsEvals : null")
-        confirmed = [p for p in payloads if p['key'] in (js_evals or [])]
+        # Key-based match is sound within a round: the round shipped exactly
+        # one payload for this key, so the key in jsEvals can only have come
+        # from that payload firing.
+        confirmed = [p for p in round_payloads if p['key'] in (js_evals or [])]
         # DOM presence of the URL payloads — the confirmation for element URL
         # sinks, which stage 2 can't click. Checked on the settled page so the
         # same SPA hydration that delays alertfunc delays the link too. A
         # navigation happening right at the end (context destroyed) must not
         # throw away the exec results already collected.
         dom_present = []
-        url_payloads = [p for p in payloads if p.get('ctx') == 'url']
+        url_payloads = [p for p in round_payloads if p.get('ctx') == 'url']
         if url_payloads:
             try:
                 hits = set(page.evaluate(DOM_PRESENT_JS, arg=[p['payload'] for p in url_payloads]) or [])

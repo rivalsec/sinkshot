@@ -819,17 +819,62 @@ async function stage2Route(route, request) {
     try { await route.continue(); } catch { /* ignore */ }
 }
 
+function partition_payload_rounds(payloads) {
+    // Split payloads into delivery rounds. preload_inject.js ships payloads
+    // as payloadMap {key: payload} — one value per param name — so two
+    // payloads on one key (one param feeding eval AND innerHTML) clobber
+    // down to the last one. The survivor reaches BOTH sinks, and a payload
+    // that is wrong for the first sink can throw there (an html breakout
+    // inside an eval argument is a SyntaxError) and kill the script before
+    // the second sink runs — neither flow confirms. Round r carries each
+    // key's (r+1)-th payload, so every key appears at most once per round
+    // and each round gets its own stage-2 reload. Pages where all keys are
+    // distinct (the common case) collapse to a single round, i.e. the
+    // previous behavior and cost. As a side effect this also makes the
+    // jsEvals wait satisfiable (it is deduped by key, so
+    // `length >= payloads.length` could never reach 2 for two payloads on
+    // one key) and the key-based confirmation sound (in a round that ships
+    // only one payload for the key, the key in jsEvals can only have come
+    // from that payload). (Mirrors mthook.py.)
+    const rounds = [];
+    const nextRound = new Map();
+    for (const p of payloads) {
+        const r = nextRound.has(p.key) ? nextRound.get(p.key) : 0;
+        nextRound.set(p.key, r + 1);
+        while (rounds.length <= r) rounds.push([]);
+        rounds[r].push(p);
+    }
+    return rounds;
+}
+
 async function process_url_stage2(context, url, payloads, beat = () => {}) {
     // Reload the same URL with canary params, but preload_inject.js returns
-    // payload values via USP hooks and hash. Returns [execConfirmed,
-    // domPresent]: payload dicts whose alertfunc actually fired, and URL
-    // payloads whose value was found on a connected element's URL attribute
-    // in the settled DOM (see DOM_PRESENT_JS). (Mirrors mthook.py.)
+    // payload values via USP hooks and hash. Payloads are delivered in
+    // rounds (see partition_payload_rounds): one reload per round, at most
+    // one payload per key per reload. Returns [execConfirmed, domPresent]:
+    // payload dicts whose alertfunc actually fired, and URL payloads whose
+    // value was found on a connected element's URL attribute in the settled
+    // DOM (see DOM_PRESENT_JS). (Mirrors mthook.py.)
     if (!payloads.length) return [[], []];
     beat();
-    const inject_script = build_inject_js(payloads);
     url = inject_canary_params(url, config.canary);
-    const hasHashPayload = payloads.some(p => p.key === '_hash');
+    const confirmedAll = [];
+    const domPresentAll = [];
+    for (const roundPayloads of partition_payload_rounds(payloads)) {
+        const [confirmed, dom_present] = await _process_url_stage2_round(
+            context, url, roundPayloads, beat);
+        confirmedAll.push(...confirmed);
+        domPresentAll.push(...dom_present);
+    }
+    return [confirmedAll, domPresentAll];
+}
+
+async function _process_url_stage2_round(context, url, roundPayloads, beat) {
+    // One stage-2 reload for a single delivery round (each key at most
+    // once). Returns [confirmed, domPresent] for this round's payloads only.
+    // (Mirrors mthook.py.)
+    const inject_script = build_inject_js(roundPayloads);
+    const hasHashPayload = roundPayloads.some(p => p.key === '_hash');
     const target_url = hasHashPayload ? url : url + `#${config.canary}_hash`;
 
     const page = await context.newPage();
@@ -852,7 +897,11 @@ async function process_url_stage2(context, url, payloads, beat = () => {}) {
             try { await page.waitForLoadState('networkidle', { timeout: ms }); } catch { /* ignore */ }
         }
         beat();
-        const expected = payloads.length;
+        // All keys in a round are distinct (partition_payload_rounds), so
+        // this count is reachable: jsEvals dedupes by key, and each key can
+        // fire at most once here. With the old single-map delivery two
+        // payloads on one key made this wait unsatisfiable by construction.
+        const expected = roundPayloads.length;
         try {
             await page.waitForFunction(
                 (n) => window.rsjsstorage && window.rsjsstorage.jsEvals.length >= n,
@@ -867,14 +916,17 @@ async function process_url_stage2(context, url, payloads, beat = () => {}) {
         const js_evals = await page.evaluate(
             () => (window.rsjsstorage ? window.rsjsstorage.jsEvals : null));
         const evals = js_evals || [];
-        const confirmed = payloads.filter(p => evals.includes(p.key));
+        // Key-based match is sound within a round: the round shipped exactly
+        // one payload for this key, so the key in jsEvals can only have
+        // come from that payload firing.
+        const confirmed = roundPayloads.filter(p => evals.includes(p.key));
         // DOM presence of the URL payloads — the confirmation for element URL
         // sinks, which stage 2 can't click. Checked on the settled page so the
         // same SPA hydration that delays alertfunc delays the link too. A
         // navigation happening right at the end (context destroyed) must not
         // throw away the exec results already collected. (Mirrors mthook.py.)
         let dom_present = [];
-        const url_payloads = payloads.filter(p => p.ctx === 'url');
+        const url_payloads = roundPayloads.filter(p => p.ctx === 'url');
         if (url_payloads.length) {
             try {
                 const hits = new Set(await page.evaluate(dom_present_in_page,
