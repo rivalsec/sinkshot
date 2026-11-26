@@ -312,6 +312,22 @@ def find_reflected_canaries(raw_html, canary):
     rgx = re.compile(canary + r'([a-zA-Z0-9_.\[\]\-]+)')
     tree = lxml_html.fromstring(raw_html)
 
+    # HTML parsers lowercase tag names, so a raw-reflected `<canary+Key>`
+    # surfaces below as a lowercased tag (rivalssscontactMsg ->
+    # rivalssscontactmsg) while the raw body still holds the key's true
+    # case. Build lower->original once and restore it on tag-name hits, or
+    # stage 2 delivers the payload as &contactmsg=... — a param the server
+    # never reads, so mixed-case reflected keys can never confirm. Text,
+    # tails, and attribute values keep their case through the parse (and
+    # reflect what the server actually emits), so they are NOT remapped.
+    orig_case = {}
+    for m in rgx.finditer(raw_html):
+        k = m.group(1)
+        orig_case.setdefault(k.lower(), k)
+
+    def _orig(k):
+        return orig_case.get(k.lower(), k)
+
     def _snippet(element):
         try:
             s = lxml_html.tostring(element, encoding='unicode', with_tail=False)
@@ -325,7 +341,8 @@ def find_reflected_canaries(raw_html, canary):
 
         # tag name itself matches canary — `<canary+key>` was reflected
         # unescaped into HTML body and parsed as an unknown empty element.
-        keys = list(dict.fromkeys(m.group(1) for m in rgx.finditer(tag)))
+        # The parser lowercased the name; restore the key's original case.
+        keys = list(dict.fromkeys(_orig(m.group(1)) for m in rgx.finditer(tag)))
         if keys:
             parent = el.getparent()
             parent_tag = parent.tag if (parent is not None and isinstance(parent.tag, str)) else 'html'
