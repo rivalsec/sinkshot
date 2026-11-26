@@ -2,7 +2,7 @@
 
 DOM XSS scanner built on Playwright. For each input URL, every query value is replaced with a marker (`<canary><param>`), a preload script hooks DOM reads and dangerous sinks, and any sink whose value still contains the marker is flagged as a flow from that param. Confirmed flows are then re-driven with context-aware payloads, and execution is verified by an `alertfunc` callback firing inside the page.
 
-There are two interchangeable implementations with the same behavior and CLI flags: [mthook.py](mthook.py) (Python) and [mthook.js](mthook.js) (Node.js). The stage-1/stage-2 hook scripts in [js/](js/) are shared by both.
+There are two interchangeable implementations with the same behavior and CLI flags: [mthook.py](mthook.py) (Python) and [mthook.js](mthook.js) (Node.js). They are the same tool — the stage-1/stage-2 hook scripts in [js/](js/) are shared by both — but the Node version tends to be more stable when scanning large URL corpora, so it's the safer pick for big runs.
 
 ## How it works
 
